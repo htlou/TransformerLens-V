@@ -8,7 +8,7 @@ attaching hooks to every notable activation within the model. This enables the i
 alteration of activations in individual components like attention heads and MLP layers, facilitating
 a deeper understanding of the internal workings of transformers like GPT-2.
 """
-
+import pdb
 import logging
 import os
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast, overload
@@ -1248,6 +1248,8 @@ class HookedTransformer(HookedRootModule):
 
         # Get the model name used in HuggingFace, rather than the alias.
         official_model_name = loading.get_official_model_name(model_name)
+        print(official_model_name)
+        # pdb.set_trace()
 
         # Load the config into an HookedTransformerConfig object. If loading from a
         # checkpoint, the config object will contain the information about the

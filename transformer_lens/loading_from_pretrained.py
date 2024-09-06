@@ -2,7 +2,7 @@
 
 This module contains functions for loading pretrained models from the Hugging Face Hub.
 """
-
+import pdb
 import dataclasses
 import logging
 import os
@@ -225,6 +225,8 @@ OFFICIAL_MODEL_NAMES = [
     "google-t5/t5-base",
     "google-t5/t5-large",
     "ai-forever/mGPT",
+    
+    "llava-hf/llava-v1.6-mistral-7b-hf"
 ]
 """Official model names for models on HuggingFace."""
 
@@ -714,7 +716,7 @@ def convert_hf_model_config(model_name: str, **kwargs):
         official_model_name = model_name
     else:
         official_model_name = get_official_model_name(model_name)
-
+    # print(official_model_name.lower())
     # Load HuggingFace model config
     if "llama" in official_model_name.lower():
         architecture = "LlamaForCausalLM"
@@ -722,6 +724,8 @@ def convert_hf_model_config(model_name: str, **kwargs):
         architecture = "Gemma2ForCausalLM"
     elif "gemma" in official_model_name.lower():
         architecture = "GemmaForCausalLM"
+    elif "llava-v1.6-mistral-7b-hf" in official_model_name.lower():
+        architecture="LlavaNextForConditionalGeneration"
     else:
         huggingface_token = os.environ.get("HF_TOKEN", None)
         hf_config = AutoConfig.from_pretrained(
@@ -730,7 +734,7 @@ def convert_hf_model_config(model_name: str, **kwargs):
             **kwargs,
         )
         architecture = hf_config.architectures[0]
-
+    # llava_architecture=LlavaNextForConditionalGeneration
     if official_model_name.startswith(
         ("llama-7b", "meta-llama/Llama-2-7b")
     ):  # same architecture for LLaMA and Llama-2
@@ -1183,7 +1187,26 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "parallel_attn_mlp": False,
             "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
         }
-
+    elif architecture =="LlavaNextForConditionalGeneration":
+        cfg_dict = {
+            "d_model": 4096,
+            "d_head": 4096 // 32,
+            "n_heads": 32,
+            "d_mlp": 14336,
+            "n_layers": 32,
+            "n_ctx": 32768,  
+            "d_vocab": 32064,
+            "act_fn": "silu",
+            "normalization_type": "RMS", # Not available
+            "positional_embedding_type": "rotary", # Not available, use mistral config
+            "window_size": 4096, # Not available
+            "attn_types": ["local"] * 32, # Not available, use mistral config
+            "eps": 1e-05, # Not available, use mistral config
+            "n_key_value_heads": 8,
+            "gated_mlp": True, # Not available, use mistral config
+            "use_local_attn": True, # Not available, use mistral config
+            "rotary_dim": 4096 // 32,
+        }
     elif official_model_name.startswith("google/gemma-2b"):
         # Architecture for Gemma 2b and Gemma 2b Instruct models
         cfg_dict = {
@@ -1428,10 +1451,12 @@ def get_pretrained_model_config(
 
     """
     if Path(model_name).exists():
+        # pdb.set_trace()
         # If the model_name is a path, it's a local model
         cfg_dict = convert_hf_model_config(model_name, **kwargs)
         official_model_name = model_name
     else:
+        # pdb.set_trace()
         official_model_name = get_official_model_name(model_name)
     if (
         official_model_name.startswith("NeelNanda")
@@ -1677,7 +1702,7 @@ def get_pretrained_state_dict(
 
         for param in hf_model.parameters():
             param.requires_grad = False
-
+        # pdb.set_trace() #需要完成convert_llava_weights函数
         if cfg.original_architecture == "GPT2LMHeadModel":
             state_dict = convert_gpt2_weights(hf_model, cfg)
         elif cfg.original_architecture == "GPTNeoForCausalLM":
@@ -1694,7 +1719,7 @@ def get_pretrained_state_dict(
             state_dict = convert_bert_weights(hf_model, cfg)
         elif cfg.original_architecture == "T5ForConditionalGeneration":
             state_dict = convert_t5_weights(hf_model, cfg)
-        elif cfg.original_architecture == "MistralForCausalLM":
+        elif cfg.original_architecture == "MistralForCausalLM" or cfg.original_architecture =="LlavaNextForConditionalGeneration":
             state_dict = convert_mistral_weights(hf_model, cfg)
         elif cfg.original_architecture == "MixtralForCausalLM":
             state_dict = convert_mixtral_weights(hf_model, cfg)
@@ -1718,7 +1743,7 @@ def get_pretrained_state_dict(
             raise ValueError(
                 f"Loading weights from the architecture is not currently supported: {cfg.original_architecture}, generated from model name {cfg.model_name}. Feel free to open an issue on GitHub to request this feature."
             )
-
+        # pdb.set_trace()
         return state_dict
 
 
