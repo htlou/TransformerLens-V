@@ -6,7 +6,7 @@ import einops
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float
-
+import pdb
 
 def simple_attn_linear(
     input: Float[torch.Tensor, "batch pos d_model"],
@@ -15,7 +15,10 @@ def simple_attn_linear(
 ) -> Float[torch.Tensor, "batch pos head_index d_head"]:
     """Linear layer for attention calculation."""
     w = einops.rearrange(w, "head_index d_model d_head -> (head_index d_head) d_model")
+
     b_ = einops.rearrange(b, "head_index d_head -> (head_index d_head)")
+
+    
     return F.linear(input, w, b_).reshape(input.shape[0], input.shape[1], b.shape[0], b.shape[1])
 
 

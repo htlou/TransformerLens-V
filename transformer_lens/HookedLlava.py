@@ -35,7 +35,9 @@ from transformer_lens.components import (
     PosEmbed,
     RMSNorm,
     RMSNormPre,
+    MistralRMSNorm,
     TransformerBlock,
+    MistralBlock,
     Unembed,
 )
 from transformer_lens.FactoredMatrix import FactoredMatrix
@@ -79,7 +81,7 @@ class Output(NamedTuple):
     loss: Loss
 
 
-class HookedTransformer(HookedRootModule):
+class HookedLlava(HookedRootModule):
     """Hooked Transformer.
 
     Implements a full Transformer using the components :doc:`here <transformer_lens.components>`,
@@ -174,7 +176,7 @@ class HookedTransformer(HookedRootModule):
             self.hook_tokens = HookPoint()  # [batch, pos]
 
         self.blocks = nn.ModuleList(
-            [TransformerBlock(self.cfg, block_index) for block_index in range(self.cfg.n_layers)]
+            [MistralBlock(self.cfg, block_index) for block_index in range(self.cfg.n_layers)]
         )
 
         if self.cfg.normalization_type == "RMS":
@@ -192,6 +194,8 @@ class HookedTransformer(HookedRootModule):
                 self.ln_final = RMSNormPre(self.cfg)
             else:
                 self.ln_final = LayerNormPre(self.cfg)
+        elif self.cfg.normalization_type == "MistralRMSNorm":
+            self.ln_final = MistralRMSNorm(self.cfg)
         elif self.cfg.normalization_type is None:
             # If it's None, don't create either layer
             pass
@@ -536,6 +540,7 @@ class HookedTransformer(HookedRootModule):
                     attention_mask=attention_mask,
                     past_kv_cache=past_kv_cache,
                 )
+                
             else:
                 assert type(input) == torch.Tensor
                 residual = input
@@ -557,7 +562,7 @@ class HookedTransformer(HookedRootModule):
                     shortformer_pos_embed = shortformer_pos_embed.to(
                         devices.get_device_for_block_index(i, self.cfg)
                     )
-
+                # import pdb; pdb.set_trace()
                 residual = block(
                     residual,
                     # Cache contains a list of HookedTransformerKeyValueCache objects, one for each
@@ -1070,7 +1075,7 @@ class HookedTransformer(HookedRootModule):
         fold_value_biases: bool = True,
         default_prepend_bos: bool = True,
         default_padding_side: Literal["left", "right"] = "right",
-        dtype="float32",
+        dtype=torch.float32,
         **from_pretrained_kwargs,
     ) -> "HookedTransformer":
         """Load in a Pretrained Model.
@@ -1266,7 +1271,7 @@ class HookedTransformer(HookedRootModule):
             dtype=dtype,
             **from_pretrained_kwargs,
         )
-
+        # pdb.set_trace()
         if cfg.positional_embedding_type == "shortformer":
             if fold_ln:
                 logging.warning(
@@ -1298,7 +1303,7 @@ class HookedTransformer(HookedRootModule):
         state_dict = loading.get_pretrained_state_dict(
             official_model_name, cfg, hf_model, dtype=dtype, **from_pretrained_kwargs
         )
-        pdb.set_trace()
+
         # Create the HookedTransformer object
         model = cls(
             cfg,
@@ -1997,6 +2002,9 @@ class HookedTransformer(HookedRootModule):
         temperature: float = 1.0,
         freq_penalty: float = 0.0,
         use_past_kv_cache: bool = True,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,    
+        image_sizes: Optional[torch.Tensor] = None,
         prepend_bos: Optional[bool] = USE_DEFAULT_VALUE,
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
         return_type: Optional[str] = "input",
@@ -2107,7 +2115,7 @@ class HookedTransformer(HookedRootModule):
 
             # An array to track which sequences in the batch have finished.
             finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=self.cfg.device)
-            pdb.set_trace()
+            # pdb.set_trace()
             # Currently nothing in HookedTransformer changes with eval, but this is here in case
             # that changes in the future.
             self.eval()

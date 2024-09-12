@@ -12,6 +12,7 @@ from .layer_norm_pre import LayerNormPre
 from .pos_embed import PosEmbed
 from .rms_norm import RMSNorm
 from .rms_norm_pre import RMSNormPre
+from .Mistral_rms_norm import MistralRMSNorm
 from .token_typed_embed import TokenTypeEmbed
 from .unembed import Unembed
 
@@ -22,7 +23,7 @@ from .embed import Embed
 from .grouped_query_attention import GroupedQueryAttention
 from .mlps.gated_mlp import GatedMLP
 from .mlps.mlp import MLP
-
+from .Mistral_attention import MistralAttention
 # Interdependent modules
 from .bert_block import BertBlock
 from .bert_embed import BertEmbed
@@ -30,3 +31,4 @@ from .mlps.moe import MoE
 from .transformer_block import TransformerBlock
 from .t5_attention import T5Attention
 from .t5_block import T5Block
+from .Mistral_block import MistralBlock

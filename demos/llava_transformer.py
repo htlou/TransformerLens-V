@@ -1,63 +1,147 @@
+import sys
+from tqdm import tqdm
 import torch
-from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor, LlavaNextImageProcessor, AutoTokenizer
-from transformer_lens import HookedTransformer
 from PIL import Image
-
+from transformers import (
+    AutoTokenizer,
+    LlavaNextForConditionalGeneration,
+    LlavaNextProcessor,
+    AutoModelForCausalLM,
+)
+sys.path.append('/aifs4su/yaodong/changye/TransformerLens')
+from transformer_lens.HookedLlava import HookedLlava
+import pdb
+pdb.set_trace()
 MODEL_PATH = "llava-hf/llava-v1.6-mistral-7b-hf"
 
-if MODEL_PATH:
+def load_models_and_processor(model_path):
+    """
+    加载处理器、视觉-语言模型和HookedTransformer语言模型。
+    """
     # 加载处理器和视觉-语言模型
-    processor = LlavaNextProcessor.from_pretrained(MODEL_PATH)
+    processor = LlavaNextProcessor.from_pretrained(model_path)
     vision_model = LlavaNextForConditionalGeneration.from_pretrained(
-        MODEL_PATH, 
-        torch_dtype=torch.float16, 
+        model_path, 
+        torch_dtype=torch.float32, 
         low_cpu_mem_usage=True
     )
     print("Vision model loaded.")
-
+    
     # 加载 HookedTransformer 语言模型
-    hf_model = vision_model.language_model
-    model = HookedTransformer.from_pretrained(
-        MODEL_PATH,
-        hf_model=hf_model,
-        device="cpu",  # Load on CPU initially
+    hook_language_model = HookedLlava.from_pretrained(
+        model_path,
+        hf_model=vision_model.language_model,
+        device="cuda", 
         fold_ln=False,
         center_writing_weights=False,
         center_unembed=False,
         tokenizer=None,
+        dtype=torch.float32,
     )
-    
+    # print(hook_language_model.state_dict().keys())
+    # print(vision_model.language_model.state_dict().keys())
     # 将模型转移到GPU（如果可用）
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    vision_model = vision_model.to(device)
+    hook_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    vision_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    hook_language_model = hook_language_model.to(hook_device)
+    vision_model = vision_model.to(vision_device)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    return processor, vision_model, hook_language_model, tokenizer
+
+def consistent_check(model, hf_model, tokenizer):
+    """
+    检查 HookedTransformer 模型输出与 Hugging Face 模型输出的一致性。
+    避免内存不够时的情况，逐步处理每个输入。
+    """
+    prompts = [
+        "The capital of Germany is",
+        "2 * 42 = ", 
+        "My favorite", 
+        "aosetuhaosuh aostud aoestuaoentsudhasuh aos tasat naostutshaosuhtnaoe usaho uaotsnhuaosntuhaosntu haouaoshat u saotheu saonuh aoesntuhaosut aosu thaosu thaoustaho usaothusaothuao sutao sutaotduaoetudet uaosthuao uaostuaoeu aostouhsaonh aosnthuaoscnuhaoshkbaoesnit haosuhaoe uasotehusntaosn.p.uo ksoentudhao ustahoeuaso usant.hsa otuhaotsi aostuhs",
+    ]
+    
+    # 切换到评估模式
+    model.eval()
+    hf_model.eval()
+
+    # 将模型参数移动到 GPU 上
+    model_device = next(model.parameters()).device
+    hf_model_device = next(hf_model.parameters()).device
+    
+    # 分别处理每一个 prompt，避免一次性加载太多
+    for i, prompt in enumerate(prompts):
+        print(f"Processing prompt {i+1}/{len(prompts)}")
+
+        # 将输入移动到模型所在的设备
+        prompt_id = tokenizer.encode(prompt, return_tensors="pt").to(model_device)
+        prompt_id_hf = tokenizer.encode(prompt, return_tensors="pt").to(hf_model_device)
+
+        # 分别计算 HookedTransformer 和 Hugging Face 模型的输出
+        tl_logits = model(prompt_id).detach().cpu()
+        hf_logits = hf_model(prompt_id_hf).logits.detach().cpu()
+
+        # 比较输出是否在允许的误差范围内
+        if not torch.allclose(hf_logits, tl_logits, atol=1e-4, rtol=1e-2):
+            print(f"Difference found in prompt {i}:")
+            print(f"hf_logits: {hf_logits}")
+            print(f"tl_logits: {tl_logits}")
+            print(f"Difference: {hf_logits - tl_logits}")
+            
+            # 打印最大绝对误差和相对误差
+            abs_diff = torch.max(torch.abs(hf_logits - tl_logits))
+            rel_diff = torch.max(torch.abs((hf_logits - tl_logits) / (tl_logits + 1e-8)))
+            print(f"Max absolute difference: {abs_diff.item()}")
+            print(f"Max relative difference: {rel_diff.item()}")
+
+            # 放宽误差条件
+            if not torch.allclose(hf_logits, tl_logits, atol=1e-3, rtol=1e-2):
+                print(f"Larger difference persists for prompt {i}, investigate further.")
+        
+        # 断言条件，严格验证差异
+        assert torch.allclose(hf_logits, tl_logits, atol=1e-4, rtol=1e-2)
+
+    print("Consistency check completed.")
+
+
+
+def process_image_and_generate_response(processor, vision_model, image_path):
+    """
+    加载图像并生成图像描述。
+    """
     # 加载本地图像
-    image_path = "/data/changye/IMG_20190131_173653.jpg"
     image = Image.open(image_path)
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is shown in this image?"},
+                {"type": "image"},
+            ],
+        },
+    ]
+    prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    
+    # 处理图像和文本输入
+    inputs = processor(images=image, text=prompt, return_tensors="pt").to("cuda:0")
+    import pdb
+    pdb.set_trace()
+    return inputs
 
-    # 使用处理器处理图像和文本
-    chat_template = "[INST] <image>\nWhat is shown in this image? [/INST]"
-    inputs = processor(images=image, text=chat_template, return_tensors="pt").to(device)
+def main():
+    # 加载模型和处理器
+    processor, vision_model, hook_language_model, tokenizer= load_models_and_processor(MODEL_PATH)
+    
+    # 进行一致性检查
+    
+    consistent_check(hook_language_model, vision_model.language_model, tokenizer)
+    # 加载图像并生成响应
+    image_path = "/aifs4su/yaodong/changye/TransformerLens/IMG_20230213_181559.jpg"
+    inputs = process_image_and_generate_response(processor, vision_model, image_path)
 
-    # 提取视觉特征
-    pixel_values = inputs['pixel_values']  # 获取图像的pixel_values
-    with torch.no_grad():
-        vision_features = vision_model.vision_tower(pixel_values)  # 提取视觉特征
-
-    # 提取文本的 input_ids
-    input_ids = inputs['input_ids']
-
-    #这一部分需要调研llava是如何拼接的
-    # # 将视觉特征和文本 input_ids 结合
-    # # 将视觉特征与文本的 token 特征联合输入 HookedTransformer 模型
-    # # 需要确保维度匹配
-    # combined_input = torch.cat([vision_features, input_ids], dim=-1)  # 示例：将视觉特征和文本结合
-
-    # # 调用模型的 generate 函数，假设它支持联合输入
-    # output_ids = model.generate(input=combined_input, max_new_tokens=100, temperature=0)
-
-    # # 解码并打印生成的文本输出
-    # tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    # output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    # print(output_text)
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    pixel_values = inputs["pixel_values"]
+    image_size = inputs["image_size"]
+if __name__ == "__main__":
+    main()

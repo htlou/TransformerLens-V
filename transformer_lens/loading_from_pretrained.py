@@ -41,6 +41,7 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_qwen2_weights,
     convert_qwen_weights,
     convert_t5_weights,
+    convert_mistral_v0_2_weights,
 )
 
 OFFICIAL_MODEL_NAMES = [
@@ -725,7 +726,7 @@ def convert_hf_model_config(model_name: str, **kwargs):
     elif "gemma" in official_model_name.lower():
         architecture = "GemmaForCausalLM"
     elif "llava-v1.6-mistral-7b-hf" in official_model_name.lower():
-        architecture="LlavaNextForConditionalGeneration"
+        architecture="MistralForCausalLM"
     else:
         huggingface_token = os.environ.get("HF_TOKEN", None)
         hf_config = AutoConfig.from_pretrained(
@@ -993,6 +994,27 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "act_fn": "gelu",
             "attention_dir": "bidirectional",
         }
+    elif architecture == "MistralForCausalLM" and "llava-v1.6-mistral-7b-hf" in official_model_name:
+        cfg_dict = {
+            "d_model": 4096,
+            "d_head": 4096 // 32,
+            "n_heads": 32,
+            "d_mlp": 14336,
+            "n_layers": 32,
+            "n_ctx": 2048,  # Capped due to memory issues
+            "d_vocab": 32064,
+            "act_fn": "silu",
+            "normalization_type": "MistralRMSNorm",
+            "positional_embedding_type": "rotary",
+            "window_size": 4096,
+            "attn_types": ["global"] * 32 ,
+            "eps": 1e-05,
+            "n_key_value_heads": 8,
+            "gated_mlp": True,
+            "use_local_attn": False,
+            "rotary_dim": 4096 // 32,
+            "rotary_base":1e6
+        }
     elif architecture == "MistralForCausalLM":
         cfg_dict = {
             "d_model": 4096,
@@ -1006,11 +1028,11 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "normalization_type": "RMS",
             "positional_embedding_type": "rotary",
             "window_size": 4096,
-            "attn_types": ["local"] * 32,
+            "attn_types":  ["local"] * 32,
             "eps": 1e-05,
             "n_key_value_heads": 8,
             "gated_mlp": True,
-            "use_local_attn": True,
+            "use_local_attn": False,
             "rotary_dim": 4096 // 32,
         }
     elif architecture == "MixtralForCausalLM":
@@ -1186,26 +1208,6 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "gated_mlp": True,
             "parallel_attn_mlp": False,
             "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
-        }
-    elif architecture =="LlavaNextForConditionalGeneration":
-        cfg_dict = {
-            "d_model": 4096,
-            "d_head": 4096 // 32,
-            "n_heads": 32,
-            "d_mlp": 14336,
-            "n_layers": 32,
-            "n_ctx": 32768,  
-            "d_vocab": 32064,
-            "act_fn": "silu",
-            "normalization_type": "RMS", # Not available
-            "positional_embedding_type": "rotary", # Not available, use mistral config
-            "window_size": 4096, # Not available
-            "attn_types": ["local"] * 32, # Not available, use mistral config
-            "eps": 1e-05, # Not available, use mistral config
-            "n_key_value_heads": 8,
-            "gated_mlp": True, # Not available, use mistral config
-            "use_local_attn": True, # Not available, use mistral config
-            "rotary_dim": 4096 // 32,
         }
     elif official_model_name.startswith("google/gemma-2b"):
         # Architecture for Gemma 2b and Gemma 2b Instruct models
@@ -1719,7 +1721,9 @@ def get_pretrained_state_dict(
             state_dict = convert_bert_weights(hf_model, cfg)
         elif cfg.original_architecture == "T5ForConditionalGeneration":
             state_dict = convert_t5_weights(hf_model, cfg)
-        elif cfg.original_architecture == "MistralForCausalLM" or cfg.original_architecture =="LlavaNextForConditionalGeneration":
+        elif cfg.original_architecture == "MistralForCausalLM" and "llava-hf/llava-v1.6-mistral-7b-hf" in official_model_name:
+            state_dict = convert_mistral_v0_2_weights(hf_model, cfg)
+        elif cfg.original_architecture == "MistralForCausalLM" :
             state_dict = convert_mistral_weights(hf_model, cfg)
         elif cfg.original_architecture == "MixtralForCausalLM":
             state_dict = convert_mixtral_weights(hf_model, cfg)
@@ -1760,6 +1764,8 @@ def fill_missing_keys(model, state_dict):
     """
     # Get the default state dict
     default_state_dict = model.state_dict()
+    # import pdb
+    # pdb.set_trace()
     # Get the keys that are missing from the pretrained model
     missing_keys = set(default_state_dict.keys()) - set(state_dict.keys())
     # Fill in the missing keys with the default initialization
