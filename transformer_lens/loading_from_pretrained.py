@@ -994,27 +994,6 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "act_fn": "gelu",
             "attention_dir": "bidirectional",
         }
-    elif architecture == "MistralForCausalLM" and "llava-v1.6-mistral-7b-hf" in official_model_name:
-        cfg_dict = {
-            "d_model": 4096,
-            "d_head": 4096 // 32,
-            "n_heads": 32,
-            "d_mlp": 14336,
-            "n_layers": 32,
-            "n_ctx": 2048,  # Capped due to memory issues
-            "d_vocab": 32064,
-            "act_fn": "silu",
-            "normalization_type": "MistralRMSNorm",
-            "positional_embedding_type": "rotary",
-            "window_size": 4096,
-            "attn_types": ["global"] * 32 ,
-            "eps": 1e-05,
-            "n_key_value_heads": 8,
-            "gated_mlp": True,
-            "use_local_attn": False,
-            "rotary_dim": 4096 // 32,
-            "rotary_base":1e6
-        }
     elif architecture == "MistralForCausalLM":
         cfg_dict = {
             "d_model": 4096,
@@ -1364,6 +1343,57 @@ def convert_hf_model_config(model_name: str, **kwargs):
         cfg_dict["trust_remote_code"] = True
     return cfg_dict
 
+def convert_vision_model_config(official_model_name: str, **kwargs):
+    """
+    Loads the config for a model trained by me (NeelNanda), converted to a dictionary
+    in the HookedTransformerConfig format.
+
+    AutoConfig is not supported, because these models are in the HookedTransformer format, so we directly download and load the json.
+    """
+    official_model_name = get_official_model_name(official_model_name)
+    cfg_json: dict = utils.download_file_from_hf(official_model_name, "config.json", **kwargs)
+    if "mistral" in official_model_name:
+        cfg_dict = {
+                "d_model": 4096,
+                "d_head": 4096 // 32,
+                "n_heads": 32,
+                "d_mlp": 14336,
+                "n_layers": 32,
+                "n_ctx": 2048,  # Capped due to memory issues
+                "d_vocab": 32064,
+                "act_fn": "silu",
+                "normalization_type": "MistralRMSNorm",
+                "positional_embedding_type": "rotary",
+                "window_size": 4096,
+                "attn_types": ["global"] * 32 ,
+                "eps": 1e-05,
+                "n_key_value_heads": 8,
+                "gated_mlp": True,
+                "use_local_attn": False,
+                "rotary_dim": 4096 // 32,
+                "rotary_base":1e6,
+                "max_position_embeddings":32768,
+            }
+    cfg_dict["original_architecture"] = "MistralForCausalLM"
+    # The name such that AutoTokenizer.from_pretrained works
+    cfg_dict["tokenizer_name"] = official_model_name
+    optional_params = [
+        "ignore_index",
+        "image_grid_pinpoints",
+        "image_token_index",
+        "projector_hidden_act",
+        "use_image_newline_parameter",
+        "vision_config",
+        "vision_feature_layer",
+        "vision_feature_select_strategy",
+        "vocab_size",
+    ]
+
+    for param in optional_params:
+        if param in cfg_json:
+            cfg_dict[param] = cfg_json[param]
+    return cfg_dict
+
 
 def convert_neel_model_config(official_model_name: str, **kwargs):
     """
@@ -1390,7 +1420,9 @@ def convert_neel_model_config(official_model_name: str, **kwargs):
         "attn_only": cfg_json["attn_only"],
         "final_rms": cfg_json.get("final_rms", False),
         "original_architecture": cfg_arch,
+        
     }
+
     if "normalization" in cfg_json:
         cfg_dict["normalization_type"] = cfg_json["normalization"]
     else:
@@ -1466,6 +1498,8 @@ def get_pretrained_model_config(
         or official_model_name.startswith("Baidicoot")
     ):
         cfg_dict = convert_neel_model_config(official_model_name, **kwargs)
+    elif "llava" in official_model_name:
+        cfg_dict=convert_vision_model_config(official_model_name, **kwargs)
     else:
         if official_model_name.startswith(NEED_REMOTE_CODE_MODELS) and not kwargs.get(
             "trust_remote_code", False

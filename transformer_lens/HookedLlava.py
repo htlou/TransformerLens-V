@@ -12,7 +12,7 @@ import logging
 import os
 import pdb
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast, overload
-
+import math
 import einops
 import numpy as np
 import torch
@@ -55,6 +55,7 @@ from transformer_lens.utils import (
     init_kaiming_uniform_,
     init_xavier_normal_,
     init_xavier_uniform_,
+    select_best_resolution,
 )
 
 SingleLoss = Float[torch.Tensor, ""]  # Type alias for a single element tensor
@@ -80,6 +81,103 @@ class Output(NamedTuple):
     logits: Float[torch.Tensor, "batch pos d_vocab"]
     loss: Loss
 
+def unpad_image(tensor, original_size):
+    """
+    Unpads a PyTorch tensor of a padded and resized image.
+
+    Args:
+        tensor (`torch.Tensor`):
+            The image tensor, assumed to be of shape (num_channels, height, width).
+        original_size (`tuple`):
+            The original size of the image (height, width).
+
+    Returns:
+        `torch.Tensor`: The unpadded image tensor.
+    """
+    original_height, original_width = original_size
+    current_height, current_width = tensor.shape[1:]
+
+    original_aspect_ratio = original_width / original_height
+    current_aspect_ratio = current_width / current_height
+
+    if original_aspect_ratio > current_aspect_ratio:
+        scale_factor = current_width / original_width
+        new_height = int(original_height * scale_factor)
+        padding = (current_height - new_height) // 2
+        unpadded_tensor = tensor[:, padding : current_height - padding, :]
+    else:
+        scale_factor = current_height / original_height
+        new_width = int(original_width * scale_factor)
+        padding = (current_width - new_width) // 2
+        unpadded_tensor = tensor[:, :, padding : current_width - padding]
+
+    return unpadded_tensor
+
+def image_size_to_num_patches(image_size, grid_pinpoints, patch_size: int):
+    """
+    Calculate the number of patches after the preprocessing for images of any resolution.
+
+    Args:
+        image_size (`torch.LongTensor` or `np.ndarray` or `Tuple[int, int]`):
+            The size of the input image in the format (height, width). ?
+        grid_pinpoints (`List`):
+            A list containing possible resolutions. Each item in the list should be a tuple or list
+            of the form `(height, width)`.
+        patch_size (`int`):
+            The size of each image patch.
+
+    Returns:
+        int: the number of patches
+    """
+    if not isinstance(grid_pinpoints, list):
+        raise TypeError("grid_pinpoints should be a list of tuples or lists")
+
+    # ! VERY IMPORTANT if image_size is tensor, must convert to into tuple, otherwise it will cause wrong calculate
+    if not isinstance(image_size, (list, tuple)):
+        if not isinstance(image_size, (torch.Tensor, np.ndarray)):
+            raise TypeError(f"image_size invalid type {type(image_size)} with value {image_size}")
+        image_size = image_size.tolist()
+
+    best_resolution = select_best_resolution(image_size, grid_pinpoints)
+    height, width = best_resolution
+    num_patches = 0
+    # consider change to ceil(height/patch_size)*ceil(width/patch_size) + 1
+    for i in range(0, height, patch_size):
+        for j in range(0, width, patch_size):
+            num_patches += 1
+    # add the base patch
+    num_patches += 1
+    return num_patches
+
+def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
+    """
+    Calculate the shape of the image patch grid after the preprocessing for images of any resolution.
+
+    Args:
+        image_size (`tuple`):
+            The size of the input image in the format (width, height).
+        grid_pinpoints (`List`):
+            A list containing possible resolutions. Each item in the list should be a tuple or list
+            of the form `(height, width)`.
+        patch_size (`int`):
+            The size of each image patch.
+
+    Returns:
+        tuple: The shape of the image patch grid in the format (width, height).
+    """
+    if not isinstance(grid_pinpoints, list):
+        raise TypeError("grid_pinpoints should be a list of tuples or lists")
+
+    # ! VERY IMPORTANT if image_size is tensor, must convert to into tuple, otherwise it will cause wrong calculate
+    if not isinstance(image_size, (list, tuple)):
+        if not isinstance(image_size, (torch.Tensor, np.ndarray)):
+            raise TypeError(
+                f"image_size invalid type: {type(image_size)} not valid, should be either list, tuple, np.ndarray or tensor"
+            )
+        image_size = image_size.tolist()
+
+    height, width = select_best_resolution(image_size, grid_pinpoints)
+    return height // patch_size, width // patch_size
 
 class HookedLlava(HookedRootModule):
     """Hooked Transformer.
@@ -125,7 +223,8 @@ class HookedLlava(HookedRootModule):
                 "Please pass in a config dictionary or HookedTransformerConfig object. If you want to load a "
                 "pretrained model, use HookedTransformer.from_pretrained() instead."
             )
-
+        self.padding_side = "left"
+        self.pad_token_id=-1
         self.cfg = HookedTransformerConfig.unwrap(cfg)
 
         if tokenizer is not None:
@@ -167,6 +266,8 @@ class HookedLlava(HookedRootModule):
 
         self.embed = Embed(self.cfg)
         self.hook_embed = HookPoint()  # [batch, pos, d_model]
+        
+        self.dtype = self.cfg.dtype
 
         if self.cfg.positional_embedding_type != "rotary":
             self.pos_embed = PosEmbed(self.cfg)
@@ -203,6 +304,10 @@ class HookedLlava(HookedRootModule):
             logging.warning("Invalid normalization_type passed in %s", self.cfg.normalization_type)
         self.unembed = Unembed(self.cfg)
 
+        embed_std = 1/math.sqrt(self.cfg.d_model)
+        self.image_newline = nn.Parameter(torch.randn(self.cfg.d_model,dtype=self.dtype) * embed_std)
+        
+        
         if self.cfg.init_weights:
             self.init_weights()
 
@@ -246,7 +351,7 @@ class HookedLlava(HookedRootModule):
             assert (
                 self.cfg.use_attn_in
             ), f"Cannot add hook {hook_point_name} if use_attn_in is False"
-
+    
     def input_to_embed(
         self,
         input: Union[str, List[str], Int[torch.Tensor, "batch pos"]],
@@ -370,6 +475,476 @@ class HookedLlava(HookedRootModule):
             )
         return residual, tokens, shortformer_pos_embed, attention_mask
 
+    def _merge_input_ids_with_image_features(
+        self,
+        image_features,
+        feature_lens,
+        inputs_embeds,
+        input_ids,
+        attention_mask,
+        position_ids=None,
+        labels=None,
+        image_token_index=None,
+        ignore_index=-100,
+    ):
+        """
+        Merge input_ids with with image features into final embeddings
+
+        Args:
+            image_features (`torch.Tensor` of shape `(all_feature_lens, embed_dim)`):
+                All vision vectors of all images in the batch
+            feature_lens (`torch.LongTensor` of shape `(num_images)`):
+                The length of visual embeddings of each image as stacked in `image_features`
+            inputs_embeds (`torch.Tensor` of shape `(batch_size, sequence_length, embed_dim)`):
+                Token embeddings before merging with visual embeddings
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Input_ids of tokens, possibly filled with image token
+            attention_mask (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Mask to avoid performing attention on padding token indices.
+            position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
+                config.n_positions - 1]`.
+            labels (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*)
+                :abels need to be recalculated to support training (if provided)
+            image_token_index (`int`, *optional*)
+                Token id used to indicate the special "image" token. Defaults to `config.image_token_index`
+            ignore_index (`int`, *optional*)
+                Value that is used to pad `labels` and will be ignored when calculated loss. Default: -100.
+        Returns:
+            final_embedding, final_attention_mask, position_ids, final_labels
+
+        Explanation:
+            each image has variable length embeddings, with length specified by feature_lens
+            image_features is concatenation of all visual embed vectors
+            task: fill each <image> with the correct number of visual embeddings
+            Example:
+                X (5 patches), Y (3 patches), Z (8)
+                X, Y are in the same sequence (in-context learning)
+            if right padding
+                input_ids: [
+                    a b c d e f X g h i j k Y l m
+                    o p q r Z s t u v _ _ _ _ _ _
+                ]
+                input_ids should be: [
+                    a b c d e f X X X X X g h i j k Y Y Y l m
+                    o p q r Z Z Z Z Z Z Z Z s t u v _ _ _ _ _
+                ]
+                labels should be: [
+                    a b c d e f _ _ _ _ _ g h i j k _ _ _ l m
+                    o p q r _ _ _ _ _ _ _ _ s t u v _ _ _ _ _
+                ]
+            elif left padding
+                input_ids: [
+                    a b c d e f X g h i j k Y l m
+                    _ _ _ _ _ _ o p q r Z s t u v
+                ]
+                input_ids should be: [
+                    a b c d e f X X X X X g h i j k Y Y Y l m
+                    _ _ _ _ _ o p q r Z Z Z Z Z Z Z Z s t u v
+                ]
+                labels should be: [
+                    a b c d e f _ _ _ _ _ g h i j k _ _ _ l m
+                    _ _ _ _ _ o p q r _ _ _ _ _ _ _ _ s t u v
+                ]
+            Edge cases:
+                * If tokens are same but image token sizes are different, then cannot infer left or right padding
+                ```python
+                cat_img = Image.open(requests.get("http://images.cocodataset.org/val2017/000000039769.jpg", stream=True).raw)
+                chart_img = Image.open(requests.get("https://github.com/haotian-liu/LLaVA/blob/1a91fc274d7c35a9b50b3cb29c4247ae5837ce39/images/llava_v1_5_radar.jpg?raw=true", stream=True).raw)
+                prompts = [
+                    "[INST] <image>\nWhat is shown in this image? [/INST]",
+                    "[INST] <image>\nWhat is shown in this image? [/INST]",
+                ]
+                inputs = processor(prompts, [chart_img, cat_img], return_tensors='pt', padding=True).to("cuda")
+                    chart_img has 2634 tokens, while cat_img has 2340 tokens
+                ```
+
+                input_ids: [
+                    a b c d X g h
+                    i j Y k l m n
+                ]
+                where X is 3 tokens while Y is 5, this mean after merge
+                if left-padding (batched generation)
+                    input_ids should be: [
+                        _ _ a b c d X X X g h
+                        i j Y Y Y Y Y k l m n
+                    ]
+                elif (right padding) (training)
+                    input_ids should be: [
+                        a b c d X X X g h _ _
+                        i j Y Y Y Y Y k l m n
+                    ]
+        """
+        image_token_index = image_token_index if image_token_index is not None else self.cfg.image_token_index
+        ignore_index = ignore_index if ignore_index is not None else self.cfg.ignore_index
+
+        if self.training and self.padding_side == "left":
+            logger.warning_once(
+                "Padding side is set to 'left' but the model is in training mode. For training "
+                "it is recommended to set `model.padding_side='right' and `processor.tokenizer.padding_side='right'`. "
+                "If that's intended, ignore this warning"
+            )
+        if not self.training and self.padding_side == "right":
+            logger.warning_once(
+                "Padding side is set to 'right' but the model is in inference mode. For correct "
+                "generation results, please set `model.padding_side='left'` and `processor.tokenizer.padding_side='left'`. "
+                "If that's intended, ignore this warning"
+            )
+
+        with torch.no_grad():
+            # ! in llava 1.6, number of patches is variable
+            num_images = feature_lens.size(0)
+            num_image_features, embed_dim = image_features.shape
+            if feature_lens.sum() != num_image_features:
+                raise ValueError(f"{feature_lens=} / {feature_lens.sum()} != {image_features.shape=}")
+            batch_size = input_ids.shape[0]
+            _left_padding = torch.any(attention_mask[:, 0] == 0)
+            _right_padding = torch.any(attention_mask[:, -1] == 0)
+
+            left_padding = self.padding_side == "left"
+            if batch_size > 1:
+                if _left_padding and _right_padding:
+                    raise ValueError(f"both side of attention_mask has zero, invalid. {attention_mask}")
+                elif _right_padding and left_padding:
+                    left_padding = False
+                elif _left_padding and not left_padding:
+                    left_padding = True
+
+            # Whether to turn off right padding
+            # 1. Create a mask to know where special image tokens are
+            special_image_token_mask = input_ids == image_token_index
+            # special_image_token_mask: [bsz, seqlen]
+            num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
+            # num_special_image_tokens: [bsz]
+            # Reserve for padding of num_images
+            total_num_special_image_tokens = torch.sum(special_image_token_mask)
+            if total_num_special_image_tokens != num_images:
+                raise ValueError(
+                    f"Number of image tokens in input_ids ({total_num_special_image_tokens}) different from num_images ({num_images})."
+                )
+            # Compute the maximum embed dimension
+            # max_image_feature_lens is max_feature_lens per batch
+            feature_lens = feature_lens.to(input_ids.device)
+            feature_lens_batch = feature_lens.split(num_special_image_tokens.tolist(), dim=0)
+            feature_lens_batch_sum = torch.tensor([x.sum() for x in feature_lens_batch], device=input_ids.device)
+            embed_sequence_lengths = (
+                (attention_mask == 1).long().sum(-1) - num_special_image_tokens + feature_lens_batch_sum
+            )
+            max_embed_dim = embed_sequence_lengths.max()
+
+            batch_indices, non_image_indices = torch.where((input_ids != image_token_index) & (attention_mask == 1))
+            # 2. Compute the positions where text should be written
+            # Calculate new positions for text tokens in merged image-text sequence.
+            # `special_image_token_mask` identifies image tokens. Each image token will be replaced by `nb_text_tokens_per_images` text tokens.
+            # `torch.cumsum` computes how each image token shifts subsequent text token positions.
+            # - 1 to adjust for zero-based indexing, as `cumsum` inherently increases indices by one.
+            # ! instead of special_image_token_mask * (num_image_patches - 1)
+            #   special_image_token_mask * (num_feature_len - 1)
+            special_image_token_mask = special_image_token_mask.long()
+            special_image_token_mask[special_image_token_mask == 1] = feature_lens - 1
+            new_token_positions = torch.cumsum((special_image_token_mask + 1), -1) - 1
+            if left_padding:
+                # shift right token positions so that they are ending at the same number
+                # the below here was incorrect? new_token_positions += new_token_positions[:, -1].max() - new_token_positions[:, -1:]
+                new_token_positions += max_embed_dim - 1 - new_token_positions[:, -1:]
+
+            text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
+
+        # 3. Create the full embedding, already padded to the maximum position
+        final_embedding = torch.zeros(
+            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
+        )
+        final_attention_mask = torch.zeros(
+            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
+        )
+        final_input_ids = torch.full(
+            (batch_size, max_embed_dim), self.pad_token_id, dtype=input_ids.dtype, device=inputs_embeds.device
+        )
+        # In case the Vision model or the Language model has been offloaded to CPU, we need to manually
+        # set the corresponding tensors into their correct target device.
+        target_device = inputs_embeds.device
+        batch_indices, non_image_indices, text_to_overwrite = (
+            batch_indices.to(target_device),
+            non_image_indices.to(target_device),
+            text_to_overwrite.to(target_device),
+        )
+        attention_mask = attention_mask.to(target_device)
+        input_ids = input_ids.to(target_device)
+
+        # 4. Fill the embeddings based on the mask. If we have ["hey" "<image>", "how", "are"]
+        # we need to index copy on [0, 577, 578, 579] for the text and [1:576] for the image features
+        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
+        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
+        final_input_ids[batch_indices, text_to_overwrite] = input_ids[batch_indices, non_image_indices]
+        final_labels = None
+        if labels is not None:
+            labels = labels.to(target_device)
+            final_labels = torch.full_like(final_attention_mask, ignore_index).to(torch.long)
+            final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
+
+        # 5. Fill the embeddings corresponding to the images. Anything that is not `text_positions` needs filling (#29835)
+        with torch.no_grad():
+            image_to_overwrite = torch.full(
+                (batch_size, max_embed_dim), True, dtype=torch.bool, device=inputs_embeds.device
+            )
+            image_to_overwrite[batch_indices, text_to_overwrite] = False
+            embed_indices = torch.arange(max_embed_dim).unsqueeze(0).to(target_device)
+            embed_indices = embed_indices.expand(batch_size, max_embed_dim)
+            embed_seq_lens = embed_sequence_lengths[:, None].to(target_device)
+
+            if left_padding:
+                # exclude padding on the left
+                max_embed_dim = max_embed_dim.to(target_device)
+                val = (max_embed_dim - embed_indices) <= embed_seq_lens
+            else:
+                # exclude padding on the right
+                val = embed_indices < embed_seq_lens
+            image_to_overwrite &= val
+
+            if image_to_overwrite.sum() != num_image_features:
+                raise ValueError(
+                    f"{image_to_overwrite.sum()=} != {num_image_features=} The input provided to the model are wrong. "
+                    f"The number of image tokens is {torch.sum(special_image_token_mask)} while"
+                    f" the number of image given to the model is {num_images}. "
+                    f"This prevents correct indexing and breaks batch generation."
+                )
+        final_embedding[image_to_overwrite] = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+        final_attention_mask |= image_to_overwrite
+        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
+
+        return final_embedding, final_attention_mask, position_ids, final_labels, final_input_ids
+
+    def pack_image_features(self, image_features, image_sizes, image_newline=None):
+        """
+        Reshape, unpad and then pack each image_feature into a single image_features tensor containing all visual vectors.
+
+        Args:
+            image_features (`List[torch.Tensor]` of length num_images, each of shape `(num_patches, image_length, embed_dim)`)
+                List of image feature tensor, each contains all the visual feature of all patches.
+            image_sizes (`torch.Tensor` of shape `(num_images, 2)`)
+                Actual image size of each images (H, W).
+            image_newline (`torch.Tensor` of shape `(embed_dim)`)
+                New line embedding vector.
+        Returns:
+            image_features (`torch.Tensor` of shape `(all_feat_len, embed_dim)`)
+            feature_lens (`List[int]`)
+                token length of each image in image_features
+        """
+        new_image_features = []
+        feature_lens = []
+        for image_idx, image_feature in enumerate(image_features):
+            if image_feature.shape[0] > 1:
+                base_image_feature = image_feature[0]
+                image_feature = image_feature[1:]
+                height = width = self.cfg.vision_config["image_size"] // self.cfg.vision_config["patch_size"]
+                if height * width != base_image_feature.shape[0]:
+                    raise ValueError("The number of patches is not consistent with the image size.")
+                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+                    image_sizes[image_idx],
+                    self.cfg.image_grid_pinpoints,
+                    self.cfg.vision_config["image_size"],
+                )
+                image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                if image_newline is not None:
+                    image_feature = torch.cat(
+                        (
+                            image_feature,
+                            image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.dtype),
+                        ),
+                        dim=-1,
+                    )
+                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+            else:
+                image_feature = image_feature[0]
+                if image_newline is not None:
+                    image_feature = torch.cat((image_feature, image_newline[None].to(image_feature)), dim=0)
+            new_image_features.append(image_feature)
+            feature_lens.append(image_feature.size(0))
+        image_features = torch.cat(new_image_features, dim=0)
+        feature_lens = torch.tensor(feature_lens, dtype=torch.long, device=image_features.device)
+        return image_features, feature_lens
+    
+    def VL_to_embed(
+        self,
+        input: Union[str, List[str], Int[torch.Tensor, "batch pos"]],
+        prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
+        padding_side: Optional[Union[Literal["left", "right"], None]] = USE_DEFAULT_VALUE,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
+        pixel_values:torch.Tensor = None,
+        image_sizes:torch.Tensor = None,
+    ) -> Tuple[
+        Float[torch.Tensor, "batch pos d_model"],  # residual
+        Optional[Int[torch.Tensor, "batch pos"]],  # tokens
+        Optional[Float[torch.Tensor, "batch pos d_model"]],  # shortformer_pos_embed
+        Optional[torch.Tensor],  # attention_mask [batch pos]
+    ]:
+      
+        position_ids=torch.arange(0, input.size(1), dtype=torch.long, device=input.device).unsqueeze(0)
+        tokens = input
+        if len(tokens.shape) == 1:
+            # If tokens are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
+            tokens = tokens[None]
+        if tokens.device.type != self.cfg.device:
+            tokens = tokens.to(devices.get_device_for_block_index(0, self.cfg))
+
+        if attention_mask is not None:
+            assert attention_mask.shape == tokens.shape, (
+                f"Attention mask shape {attention_mask.shape} does not match tokens shape "
+                f"{tokens.shape}"
+            )
+            attention_mask = attention_mask.to(devices.get_device_for_block_index(0, self.cfg))
+        elif (
+            self.tokenizer and self.tokenizer.padding_side == "left"
+        ) or past_kv_cache is not None:
+            # If the padding side is left or we are using caching, we need to compute the attention
+            # mask for the adjustment of absolute positional embeddings and attention masking so
+            # that pad tokens are not attended.
+
+            if prepend_bos is USE_DEFAULT_VALUE:
+                prepend_bos = self.cfg.default_prepend_bos
+            attention_mask = utils.get_attention_mask(self.tokenizer, tokens, prepend_bos)
+
+            if past_kv_cache is not None:
+                # past_kv_cache is not None, so we're doing caching.
+                # We need to extend the previous attention_mask.
+                # Update the past_kv_cache with the new attention_mask (unless it's frozen)
+                attention_mask = past_kv_cache.append_attention_mask(attention_mask)
+        else:
+            # We separate this case from for computational efficiency.
+            attention_mask = None
+
+        # If we're doing caching, then we reuse keys and values from previous runs, as that's the
+        # only way that past activations will affect the final logits. The cache contains those so
+        # we don't need to recompute them. This is useful for generating text. As we have absolute
+        # positional encodings, to implement this we have a `pos_offset` variable, defaulting to
+        # zero, which says to offset which positional encodings are used (cached keys and values
+        # were calculated with their own positional encodings).
+        if past_kv_cache is None:
+            pos_offset = 0
+        else:
+            batch_size, ctx_length = tokens.shape
+            (
+                cached_batch_size,
+                cache_ctx_length,
+                num_heads_in_cache,
+                d_head_in_cache,
+            ) = past_kv_cache[0].past_keys.shape
+            assert cached_batch_size == batch_size
+            if self.cfg.n_key_value_heads is None:
+                assert num_heads_in_cache == self.cfg.n_heads
+            else:
+                assert num_heads_in_cache == self.cfg.n_key_value_heads
+            assert d_head_in_cache == self.cfg.d_head
+            pos_offset = cache_ctx_length
+        if self.cfg.use_hook_tokens:
+            tokens = self.hook_tokens(tokens)
+        embed = self.hook_embed(self.embed(tokens))  # [batch, pos, d_model]
+        if self.cfg.positional_embedding_type == "standard":
+            pos_embed = self.hook_pos_embed(
+                self.pos_embed(tokens, pos_offset, attention_mask)
+            )  # [batch, pos, d_model]
+            residual = embed + pos_embed  # [batch, pos, d_model]
+            shortformer_pos_embed = None
+        elif self.cfg.positional_embedding_type == "shortformer":
+            # If we're using shortformer style attention, we don't add the positional embedding to
+            # the residual stream. See HookedTransformerConfig for details
+            pos_embed = self.hook_pos_embed(
+                self.pos_embed(tokens, pos_offset, attention_mask)
+            )  # [batch, pos, d_model]
+            residual = embed
+            shortformer_pos_embed = pos_embed
+        elif self.cfg.positional_embedding_type == "rotary":
+            # Rotary doesn't use positional embeddings, instead they're applied when dot producting
+            # keys and queries. See HookedTransformerConfig for details
+            residual = embed
+            shortformer_pos_embed = None
+        elif self.cfg.positional_embedding_type == "alibi":
+            # ALiBi does not add positional embeddings to word embeddings,instead it biases QK attention scores.
+            residual = embed
+            shortformer_pos_embed = None
+        else:
+            raise ValueError(
+                f"Invalid positional_embedding_type passed in {self.cfg.positional_embedding_type}"
+            )
+        
+        inputs_embeds = residual
+        #需要加载的
+        '''
+        image_size_to_num_patches() DONE
+            select_best_resolution()   (image_processing_utils.py) DONE
+        self.config.image_grid_pinpoints DONE
+        self.config.vision_config.image_size DONE
+        self.vision_tower DONE
+        self.multi_modal_projector DONE
+        pack_image_features() DONE
+        self.image_newline DONE
+        _merge_input_ids_with_image_features() DONE
+        self.config.image_token_index DONE
+        inputs_embeds.masked_scatter()  (torch)
+        '''
+        #-------------#
+
+            # if the number of image tokens is more than image embeddings seq length, then prob we expanded it in processing
+            # not very reliable, but we don't expect one to actually pass 500+ images for one prompt
+            # In case we're in decoding stage, legacy behavior is checked by presence of pixel values even if use_cache=True
+        if pixel_values is not None and tokens.shape[1] != 1 and pixel_values.size(0) > 0:
+            # ! infer image_num_patches from image_sizes
+            image_num_patches = [
+                image_size_to_num_patches(
+                    image_size=imsize,
+                    grid_pinpoints=self.cfg.image_grid_pinpoints,
+                    patch_size=self.cfg.vision_config["image_size"],
+                )
+                for imsize in image_sizes
+            ]
+            # figure out if pixel_values is concatenated or stacked
+            if pixel_values.dim() == 5:
+                # stacking when input is (batch_size, num_patches, num_channels, height, width)
+                _pixel_values_list = [
+                    pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)
+                ]
+                pixel_values = torch.cat(_pixel_values_list, dim=0)
+            elif pixel_values.dim() != 4:
+                # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
+                raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
+
+            image_features = self.vision_tower(pixel_values, output_hidden_states=True)
+            selected_image_feature = image_features.hidden_states[self.cfg.vision_feature_layer]
+            
+            if self.cfg.vision_feature_select_strategy == "default":
+                selected_image_feature = selected_image_feature[:, 1:]
+            elif self.cfg.vision_feature_select_strategy == "full":
+                selected_image_feature = selected_image_feature
+            image_features = self.multi_modal_projector(selected_image_feature)
+            image_features = torch.split(image_features, image_num_patches, dim=0)
+            # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
+            image_features, feature_lens = self.pack_image_features(
+                image_features,
+                image_sizes,
+                image_newline=self.image_newline,
+            )
+            inputs_embeds = inputs_embeds.to(image_features.dtype)
+            inputs_embeds, attention_mask, position_ids, labels, _ = self._merge_input_ids_with_image_features(
+                    image_features,
+                    feature_lens,
+                    inputs_embeds,
+                    tokens,
+                    attention_mask,
+                    position_ids,
+                )
+            # special_image_mask = (
+            #     (input == self.cfg.image_token_index).unsqueeze(-1).expand_as(inputs_embeds)
+            # )
+            # image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            # inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+        
+        return inputs_embeds, tokens, shortformer_pos_embed, attention_mask
+    
     @overload
     def forward(
         self,
@@ -446,6 +1021,9 @@ class HookedLlava(HookedRootModule):
             Int[torch.Tensor, "batch pos"],
             Float[torch.Tensor, "batch pos d_model"],
         ],
+        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
+        pixel_values: Optional[torch.Tensor] = None,
+        image_sizes: Optional[torch.Tensor] = None,
         return_type: Optional[str] = "logits",
         loss_per_token: bool = False,
         prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
@@ -453,7 +1031,7 @@ class HookedLlava(HookedRootModule):
         start_at_layer: Optional[int] = None,
         tokens: Optional[Int[torch.Tensor, "batch pos"]] = None,
         shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]] = None,
-        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
+
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
     ) -> Union[
@@ -526,25 +1104,30 @@ class HookedLlava(HookedRootModule):
 
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
-        ):
+        ):  
             if start_at_layer is None:
                 (
                     residual,
                     tokens,
                     shortformer_pos_embed,
                     attention_mask,
-                ) = self.input_to_embed(
+                ) = self.VL_to_embed(
                     input,
                     prepend_bos=prepend_bos,
                     padding_side=padding_side,
-                    attention_mask=attention_mask,
                     past_kv_cache=past_kv_cache,
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    attention_mask=attention_mask,
                 )
                 
             else:
                 assert type(input) == torch.Tensor
                 residual = input
-
+            '''
+            position_id
+            attention_mask
+            '''
             if start_at_layer is None:
                 start_at_layer = 0
             # If we explicitly want to start or stop at a layer, we only iterate through the blocks
@@ -600,6 +1183,7 @@ class HookedLlava(HookedRootModule):
                     else:
                         logging.warning(f"Invalid return_type passed in: {return_type}")
                         return None
+    
 
     def loss_fn(
         self,
@@ -1075,6 +1659,8 @@ class HookedLlava(HookedRootModule):
         fold_value_biases: bool = True,
         default_prepend_bos: bool = True,
         default_padding_side: Literal["left", "right"] = "right",
+        vision_tower=None,
+        multi_modal_projector=None,
         dtype=torch.float32,
         **from_pretrained_kwargs,
     ) -> "HookedTransformer":
@@ -1212,6 +1798,7 @@ class HookedLlava(HookedRootModule):
                 "right".
         """
 
+
         assert not (
             from_pretrained_kwargs.get("load_in_8bit", False)
             or from_pretrained_kwargs.get("load_in_4bit", False)
@@ -1271,6 +1858,7 @@ class HookedLlava(HookedRootModule):
             dtype=dtype,
             **from_pretrained_kwargs,
         )
+
         # pdb.set_trace()
         if cfg.positional_embedding_type == "shortformer":
             if fold_ln:
@@ -1325,7 +1913,8 @@ class HookedLlava(HookedRootModule):
             model.move_model_modules_to_device()
 
         print(f"Loaded pretrained model {model_name} into HookedTransformer")
-
+        model.vision_tower=vision_tower
+        model.multi_modal_projector=multi_modal_projector
         return model
 
     @classmethod
@@ -1992,8 +2581,8 @@ class HookedLlava(HookedRootModule):
     @torch.inference_mode()
     def generate(
         self,
-        input: Union[str, Float[torch.Tensor, "batch pos"]] = "",
-        max_new_tokens: int = 10,
+        inputs: dict[str, torch.Tensor] = None,
+        max_new_tokens: int = 100,
         stop_at_eos: bool = True,
         eos_token_id: Optional[int] = None,
         do_sample: bool = True,
@@ -2002,14 +2591,12 @@ class HookedLlava(HookedRootModule):
         temperature: float = 1.0,
         freq_penalty: float = 0.0,
         use_past_kv_cache: bool = True,
-        attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,    
-        image_sizes: Optional[torch.Tensor] = None,
         prepend_bos: Optional[bool] = USE_DEFAULT_VALUE,
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
         return_type: Optional[str] = "input",
         verbose: bool = True,
     ) -> Union[Int[torch.Tensor, "batch pos_plus_new_tokens"], str]:
+        
         """Sample Tokens from the Model.
 
         Sample tokens from the model until the model outputs eos_token or max_new_tokens is reached.
@@ -2063,25 +2650,41 @@ class HookedLlava(HookedRootModule):
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
         ):
-            if type(input) == str:
-                # If text, convert to tokens (batch_size=1)
-                assert (
-                    self.tokenizer is not None
-                ), "Must provide a tokenizer if passing a string to the model"
-                tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
+            # if type(input) == str:
+            #     # If text, convert to tokens (batch_size=1)
+            #     assert (
+            #         self.tokenizer is not None
+            #     ), "Must provide a tokenizer if passing a string to the model"
+            #     tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
+            # else:
+            #     tokens = input
+            input_ids=inputs["input_ids"]
+            vision=True
+            if "attention_mask" in inputs:
+                attention_mask=inputs["attention_mask"]
+            if "pixel_values" in inputs:
+                pixel_values=inputs["pixel_values"]
             else:
-                tokens = input
-
-            if return_type == "input":
-                if type(input) == str:
-                    return_type = "str"
-                else:
-                    return_type = "tensor"
-
-            assert isinstance(tokens, torch.Tensor)
-            batch_size, ctx_length = tokens.shape
+                vision=False
+            if "image_sizes" in inputs:
+                image_sizes=inputs["image_sizes"]
+            
+            # if return_type == "input":
+            #     if type(input) == str:
+            #         return_type = "str"
+            #     else:
+            #         return_type = "tensor"
+            return_type = "str"
+            
+            assert isinstance(input_ids, torch.Tensor)
+            batch_size, ctx_length = input_ids.shape
             device = devices.get_device_for_block_index(0, self.cfg)
-            tokens = tokens.to(device)
+            tokens = input_ids.to(device)
+            if vision:
+                attention_mask = attention_mask.to(device)
+                pixel_values = pixel_values.to(device)
+                image_sizes = image_sizes.to(device)
+            
             if use_past_kv_cache:
                 past_kv_cache = HookedTransformerKeyValueCache.init_cache(
                     self.cfg, self.cfg.device, batch_size
@@ -2123,33 +2726,67 @@ class HookedLlava(HookedRootModule):
                 # While generating, we keep generating logits, throw away all but the final logits,
                 # and then use those logits to sample from the distribution We keep adding the
                 # sampled tokens to the end of tokens.
+
                 if use_past_kv_cache:
                     # We just take the final tokens, as a [batch, 1] tensor
                     if index > 0:
-                        logits = self.forward(
-                            tokens[:, -1:],
-                            return_type="logits",
-                            prepend_bos=prepend_bos,
-                            padding_side=padding_side,
-                            past_kv_cache=past_kv_cache,
-                        )
+                        if vision:
+                            logits = self.forward(
+                                tokens[:, -1:],
+                                pixel_values=pixel_values,
+                                image_sizes=image_sizes,
+                                return_type="logits",
+                                prepend_bos=prepend_bos,
+                                padding_side=padding_side,
+                                past_kv_cache=past_kv_cache,
+                            )
+                        else:
+                            logits = self.forward(
+                                tokens[:, -1:],
+                                return_type="logits",
+                                prepend_bos=prepend_bos,
+                                padding_side=padding_side,
+                                past_kv_cache=past_kv_cache,
+                            )
                     else:
+                        if vision:
+                            logits = self.forward(
+                                    tokens,
+                                    pixel_values=pixel_values,
+                                    image_sizes=image_sizes,
+                                    return_type="logits",
+                                    prepend_bos=prepend_bos,
+                                    padding_side=padding_side,
+                                    attention_mask=attention_mask,
+                                )
+                        else: 
+                            logits = self.forward(
+                                tokens,
+                                return_type="logits",
+                                prepend_bos=prepend_bos,
+                                padding_side=padding_side,
+                                past_kv_cache=past_kv_cache,
+                            )
+                else:
+                    # We input the entire sequence, as a [batch, pos] tensor, since we aren't using
+                    # the cache.
+                    if vision:
                         logits = self.forward(
+                                tokens,
+                                attention_mask=attention_mask,
+                                pixel_values=pixel_values,
+                                image_sizes=image_sizes,
+                                return_type="logits",
+                                prepend_bos=prepend_bos,
+                                padding_side=padding_side,
+                            )
+                    else:
+                        logits = self.forward( 
                             tokens,
                             return_type="logits",
                             prepend_bos=prepend_bos,
                             padding_side=padding_side,
-                            past_kv_cache=past_kv_cache,
                         )
-                else:
-                    # We input the entire sequence, as a [batch, pos] tensor, since we aren't using
-                    # the cache.
-                    logits = self.forward(
-                        tokens,
-                        return_type="logits",
-                        prepend_bos=prepend_bos,
-                        padding_side=padding_side,
-                    )
                 final_logits = logits[:, -1, :]
 
                 if do_sample:
@@ -2183,15 +2820,15 @@ class HookedLlava(HookedRootModule):
                 if stop_at_eos and finished_sequences.all():
                     break
 
-            if return_type == "str":
-                if self.cfg.default_prepend_bos:
-                    # If we prepended a BOS token, remove it when returning output.
-                    return self.tokenizer.decode(tokens[0, 1:])
-                else:
-                    return self.tokenizer.decode(tokens[0])
+            # if return_type == "str":
+            #     if self.cfg.default_prepend_bos:
+            #         # If we prepended a BOS token, remove it when returning output.
+            #         return self.tokenizer.decode(tokens[0, 1:])
+            #     else:
+            #         return self.tokenizer.decode(tokens[0])
 
-            else:
-                return tokens
+            # else:
+            return tokens
 
     # Give access to all weights as properties.
     @property

@@ -10,8 +10,8 @@ from transformers import (
 )
 sys.path.append('/aifs4su/yaodong/changye/TransformerLens')
 from transformer_lens.HookedLlava import HookedLlava
-import pdb
-pdb.set_trace()
+# import pdb
+# pdb.set_trace()
 MODEL_PATH = "llava-hf/llava-v1.6-mistral-7b-hf"
 
 def load_models_and_processor(model_path):
@@ -31,6 +31,8 @@ def load_models_and_processor(model_path):
     hook_language_model = HookedLlava.from_pretrained(
         model_path,
         hf_model=vision_model.language_model,
+        vision_tower=vision_model.vision_tower,
+        multi_modal_projector=vision_model.multi_modal_projector,
         device="cuda", 
         fold_ln=False,
         center_writing_weights=False,
@@ -42,7 +44,7 @@ def load_models_and_processor(model_path):
     # print(vision_model.language_model.state_dict().keys())
     # 将模型转移到GPU（如果可用）
     hook_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    vision_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    vision_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     hook_language_model = hook_language_model.to(hook_device)
     vision_model = vision_model.to(vision_device)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -124,8 +126,7 @@ def process_image_and_generate_response(processor, vision_model, image_path):
     
     # 处理图像和文本输入
     inputs = processor(images=image, text=prompt, return_tensors="pt").to("cuda:0")
-    import pdb
-    pdb.set_trace()
+    
     return inputs
 
 def main():
@@ -134,14 +135,16 @@ def main():
     
     # 进行一致性检查
     
-    consistent_check(hook_language_model, vision_model.language_model, tokenizer)
+    # consistent_check(hook_language_model, vision_model.language_model, tokenizer)
     # 加载图像并生成响应
     image_path = "/aifs4su/yaodong/changye/TransformerLens/IMG_20230213_181559.jpg"
     inputs = process_image_and_generate_response(processor, vision_model, image_path)
+    # outputs = hook_language_model.generate(inputs)
+    import pdb
+    pdb.set_trace()
+    output = hook_language_model.generate(inputs)
+    
+    print(processor.decode(output[0], skip_special_tokens=True))
 
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-    pixel_values = inputs["pixel_values"]
-    image_size = inputs["image_size"]
 if __name__ == "__main__":
     main()
