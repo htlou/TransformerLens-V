@@ -982,7 +982,7 @@ class HookedLlava(HookedRootModule):
         #         position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
         
         # return inputs_embeds, input_ids, position_ids, attention_mask
-    
+        pass
     @overload
     def forward(
         self,
@@ -1069,74 +1069,13 @@ class HookedLlava(HookedRootModule):
         attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
+        
     ) -> Union[
         None,
         Float[torch.Tensor, "batch pos d_vocab"],
         Loss,
         Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss],
     ]:
-        """Forward Pass.
-
-        Input is either a batch of tokens ([batch, pos]) or a text string, a string is automatically
-        tokenized to a batch of a single element. The prepend_bos flag only applies when inputting a
-        text string.
-
-        Note that loss is the standard "predict the next token" cross-entropy loss for GPT-2 style
-        language models - if you want a custom loss function, the recommended behaviour is returning
-        the logits and then applying your custom loss function.
-
-        Args:
-            return_type Optional[str]: The type of output to return. Can be one of: None (return
-                nothing, don't calculate logits), 'logits' (return logits), 'loss' (return
-                cross-entropy loss), 'both' (return logits and loss).
-            loss_per_token bool: Whether to return the (next token prediction) loss per token (True)
-                or average (False). Average loss is a scalar (averaged over position *and* batch),
-                per-token loss is a tensor ([batch, position-1]) - position-1 because we're
-                predicting the next token, and there's no specified next token for the final token.
-                Defaults to False.
-            prepend_bos Optional[bool]: Overrides self.cfg.default_prepend_bos. Whether to prepend
-                the BOS token to the input (only applies when input is a string). Defaults to None,
-                implying usage of self.cfg.default_prepend_bos which is set to True unless specified
-                otherwise. (Even for models not explicitly trained with a prepended BOS token, heads
-                often use the first position as a resting position and accordingly lose information
-                from the first token, so this empirically seems to give better results.) Pass True
-                or False to locally override the default.
-            padding_side Optional[Literal["left", "right"]]: Overrides self.tokenizer.padding_side.
-                Specifies which side to pad on when tokenizing multiple strings of different
-                lengths.
-            start_at_layer Optional[int]: If not None, start the forward pass at the specified
-                layer. Requires input to be the residual stream before the specified layer with
-                shape [batch, pos, d_model]. Inclusive - ie, start_at_layer = 0 skips the embedding
-                then runs the rest of the model. Supports negative indexing. start_at_layer = -1
-                only runs the final block and the unembedding. Defaults to None (run the full
-                model).
-            tokens: Optional[Int[torch.Tensor, "batch pos"]]: Tokenized input. Only use if
-                start_at_layer is not None and return type is "loss" or "both".
-            shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]]: Positional
-                embedding for shortformer models. Only use if start_at_layer is not None and
-                self.cfg.positional_embedding_type == "shortformer".
-            attention_mask: Optional[torch.Tensor]: Override the attention mask used to ignore
-                padded tokens. If start_at_layer is not None and (self.tokenizer.padding_side ==
-                "left" or past_kv_cache is not None), this should be passed as the attention mask
-                is not computed automatically. Defaults to None.
-            stop_at_layer Optional[int]: If not None, stop the forward pass at the specified layer.
-                Exclusive - ie, stop_at_layer = 0 will only run the embedding layer, stop_at_layer =
-                1 will run the embedding layer and the first transformer block, etc. Supports
-                negative indexing. Useful for analysis of intermediate layers, eg finding neuron
-                activations in layer 3 of a 24 layer model. Defaults to None (run the full model).
-                If not None, we return the last residual stream computed.
-            past_kv_cache Optional[HookedTransformerKeyValueCache]: If not None, keys and values
-                will be stored for every attention head (unless the cache is frozen). If there are
-                keys and values already in the cache, these will be prepended to the keys and values
-                for the new input, so that the new tokens can pay attention to previous tokens. This
-                is useful for generating text, because we don't need to repeat computation for
-                tokens that have already been through the model. Also caches attention_mask so
-                previous tokens are masked correctly (unless frozen). Padding should be ignored in
-                all cases, so it's okay to eg. pass in left padded tokens twice in a row.
-                Warning: Don't accidentally prepend_bos to the second half of a prompt.
-                Defaults to None (don't use caching).
-        """
-
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
         ):
@@ -2605,7 +2544,7 @@ class HookedLlava(HookedRootModule):
     @torch.inference_mode()
     def generate(
         self,
-        input: Union[str, Float[torch.Tensor, "batch pos"]] = "",
+        inputs: dict[str, torch.Tensor] = None,
         max_new_tokens: int = 10,
         stop_at_eos: bool = True,
         eos_token_id: Optional[int] = None,
@@ -2615,81 +2554,39 @@ class HookedLlava(HookedRootModule):
         temperature: float = 1.0,
         freq_penalty: float = 0.0,
         use_past_kv_cache: bool = True,
-        attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.Tensor] = None,    
-        image_sizes: Optional[torch.Tensor] = None,
         prepend_bos: Optional[bool] = USE_DEFAULT_VALUE,
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
         return_type: Optional[str] = "input",
         verbose: bool = True,
     ) -> Union[Int[torch.Tensor, "batch pos_plus_new_tokens"], str]:
-        """Sample Tokens from the Model.
-
-        Sample tokens from the model until the model outputs eos_token or max_new_tokens is reached.
-
-        To avoid fiddling with ragged tensors, if we input a batch of text and some sequences finish
-        (by producing an EOT token), we keep running the model on the entire batch, but throw away
-        the output for a finished sequence and just keep adding EOTs to pad.
-
-        This supports entering a single string, but not a list of strings - if the strings don't
-        tokenize to exactly the same length, this gets messy. If that functionality is needed,
-        convert them to a batch of tokens and input that instead.
-
-        Args:
-            input (Union[str, Int[torch.Tensor, "batch pos"])]): Either a batch of tokens ([batch,
-                pos]) or a text string (this will be converted to a batch of tokens with batch size
-                1).
-            max_new_tokens (int): Maximum number of tokens to generate.
-            stop_at_eos (bool): If True, stop generating tokens when the model outputs eos_token.
-            eos_token_id (Optional[Union[int, Sequence]]): The token ID to use for end
-                of sentence. If None, use the tokenizer's eos_token_id - required if using
-                stop_at_eos. It's also possible to provide a list of token IDs (not just the
-                eos_token_id), in which case the generation will stop when any of them are output
-                (useful e.g. for stable_lm).
-            do_sample (bool): If True, sample from the model's output distribution. Otherwise, use
-                greedy search (take the max logit each time).
-            top_k (int): Number of tokens to sample from. If None, sample from all tokens.
-            top_p (float): Probability mass to sample from. If 1.0, sample from all tokens. If <1.0,
-                we take the top tokens with cumulative probability >= top_p.
-            temperature (float): Temperature for sampling. Higher values will make the model more
-                random (limit of temp -> 0 is just taking the top token, limit of temp -> inf is
-                sampling from a uniform distribution).
-            freq_penalty (float): Frequency penalty for sampling - how much to penalise previous
-                tokens. Higher values will make the model more random.
-            use_past_kv_cache (bool): If True, create and use cache to speed up generation.
-            prepend_bos (bool, optional): Overrides self.cfg.default_prepend_bos. Whether to prepend
-                the BOS token to the input (applicable when input is a string). Defaults to None,
-                implying usage of self.cfg.default_prepend_bos (default is True unless specified
-                otherwise). Pass True or False to override the default.
-            padding_side (Union[Literal["left", "right"], None], optional): Overrides
-                self.tokenizer.padding_side. Specifies which side to pad when tokenizing multiple
-                strings of different lengths.
-            return_type (Optional[str]): The type of the output to return - either a string (str),
-                a tensor of tokens (tensor) or whatever the format of the input was (input).
-            verbose (bool): If True, show tqdm progress bars for generation.
-
-        Returns:
-            outputs (torch.Tensor): [batch, pos + max_new_tokens], generated sequence of new tokens
-                (by default returns same type as input).
-        """
 
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
         ):
-            if type(input) == str:
-                # If text, convert to tokens (batch_size=1)
-                assert (
-                    self.tokenizer is not None
-                ), "Must provide a tokenizer if passing a string to the model"
-                tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
-            else:
-                tokens = input
-
-            if return_type == "input":
-                if type(input) == str:
-                    return_type = "str"
+            input_ids=inputs.get("input_ids",inputs)
+            vision=False
+            attention_mask = inputs.get("attention_mask", None)
+            pixel_values = inputs.get("pixel_values", None)
+            image_sizes = inputs.get("image_sizes", None)
+            if input_ids==inputs:
+                if type(inputs) == str:
+                    # If text, convert to tokens (batch_size=1)
+                    assert (
+                        self.tokenizer is not None
+                    ), "Must provide a tokenizer if passing a string to the model"
+                    tokens = self.to_tokens(inputs, prepend_bos=prepend_bos, padding_side=padding_side)
                 else:
-                    return_type = "tensor"
+                    tokens = inputs
+
+                if return_type == "input":
+                    if type(inputs) == str:
+                        return_type = "str"
+                    else:
+                        return_type = "tensor"
+            else:   
+                tokens=input_ids
+                vision=True
+                return_type = "tensor"
 
             assert isinstance(tokens, torch.Tensor)
             batch_size, ctx_length = tokens.shape
@@ -2745,6 +2642,9 @@ class HookedLlava(HookedRootModule):
                             prepend_bos=prepend_bos,
                             padding_side=padding_side,
                             past_kv_cache=past_kv_cache,
+                            image_sizes=image_sizes,
+                            attention_mask=attention_mask,
+                            pixel_values=pixel_values,
                         )
                     else:
                         logits = self.forward(
@@ -2753,6 +2653,9 @@ class HookedLlava(HookedRootModule):
                             prepend_bos=prepend_bos,
                             padding_side=padding_side,
                             past_kv_cache=past_kv_cache,
+                            image_sizes=image_sizes,
+                            attention_mask=attention_mask,
+                            pixel_values=pixel_values,
                         )
                 else:
                     # We input the entire sequence, as a [batch, pos] tensor, since we aren't using
@@ -2762,6 +2665,9 @@ class HookedLlava(HookedRootModule):
                         return_type="logits",
                         prepend_bos=prepend_bos,
                         padding_side=padding_side,
+                        image_sizes=image_sizes,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
                     )
                 final_logits = logits[:, -1, :]
 

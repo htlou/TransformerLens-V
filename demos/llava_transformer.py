@@ -8,7 +8,7 @@ from transformers import (
     LlavaNextProcessor,
     AutoModelForCausalLM,
 )
-sys.path.append('/aifs4su/yaodong/changye/TransformerLens-0ccdeb21bc5284d43746ceff96d1a3ec98c09457')
+sys.path.append('/aifs4su/yaodong/changye/TransformerLens_soft')
 from transformer_lens.HookedLlava import HookedLlava
 import pdb
 pdb.set_trace()
