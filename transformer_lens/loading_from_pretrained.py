@@ -1359,7 +1359,7 @@ def convert_vision_model_config(official_model_name: str, **kwargs):
                 "n_heads": 32,
                 "d_mlp": 14336,
                 "n_layers": 32,
-                "n_ctx": 2048,  # Capped due to memory issues
+                "n_ctx": 32768,  # Capped due to memory issues
                 "d_vocab": 32064,
                 "act_fn": "silu",
                 "normalization_type": "MistralRMSNorm",

@@ -927,8 +927,9 @@ class HookedLlava(HookedRootModule):
         elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
                 # Retrieve the first layer to inspect the logits and mask out the hidden states
                 # that are set to 0
-                first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
-
+                # 如果出问题，可以确认以下是否应该传递的是key
+                first_layer_past_key_value = past_key_values[0].past_keys[:, :, :, 0]
+                first_layer_past_key_value=first_layer_past_key_value.transpose(1,2)
                 # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
                 batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
 
@@ -1067,6 +1068,8 @@ class HookedLlava(HookedRootModule):
             attention_mask=model_inputs["attention_mask"]
             pixel_values=model_inputs["pixel_values"]
             image_sizes=model_inputs["image_sizes"]
+            if not torch.equal(input, model_inputs["input_ids"]):
+                model_inputs["input_ids"]=input
         
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
@@ -1076,15 +1079,16 @@ class HookedLlava(HookedRootModule):
                     residual,
                     tokens,
                     shortformer_pos_embed,
-                    attention_mask,
+                    _,
                 ) = self.input_to_embed(
                     input,
                     prepend_bos=prepend_bos,
                     padding_side=padding_side,
-                    attention_mask=attention_mask,
+                    attention_mask=None,
                     past_kv_cache=past_kv_cache,
                 )
                 if vision:
+                    # 第一次以后attention_mask长度不变，inputs_embeds长度为1
                     attention_mask,position_ids,past_kv_cache,inputs_embeds = self.vision_embed(
                         inputs_embeds=residual,
                         pixel_values=pixel_values,
@@ -2399,6 +2403,8 @@ class HookedLlava(HookedRootModule):
             refactor_factored_attn_matrices=refactor_factored_attn_matrices,
         )
 
+    
+    
     @torch.inference_mode()
     def generate(
         self,
@@ -2493,6 +2499,7 @@ class HookedLlava(HookedRootModule):
                 # sampled tokens to the end of tokens.
                 if vision:
                     model_inputs=self.prepare_inputs_for_generation(tokens, past_kv_cache=past_kv_cache, image_sizes=image_sizes, attention_mask=attention_mask, pixel_values=pixel_values, vision=vision,use_kv_cache=use_past_kv_cache)
+                    attention_mask=torch.cat([attention_mask,torch.ones((batch_size,1),device=device)],dim=1)
                 # model_inputs={
                 #     "position_ids": position_ids,
                 #     "past_key_values": past_key_values,
