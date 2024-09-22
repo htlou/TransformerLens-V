@@ -131,56 +131,8 @@ class MistralAttention(AbstractAttention):
         #         attn_scores / self.cfg.attn_scores_soft_cap
         #     )
         return attn_scores
-    def apply_causal_mask(
-        self,
-        attn_scores: Float[torch.Tensor, "batch head_index pos pos_plus_past_kv_pos_offset"],
-        past_kv_pos_offset: int = 0,
-        attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
-    ):
-        # The query context length is the number of positions we take queries from - if not using a past_kv_cache this is just the context length (for the current prompt), but if we're caching it can be different.
-        query_ctx_length = attn_scores.size(-2)
-        # The key context length is the number of positions in the past - this includes all positions in the cache
-        # If not caching, query_ctx_length == key_ctx_length
-        key_ctx_length = attn_scores.size(-1)
 
-        if query_ctx_length + past_kv_pos_offset != key_ctx_length:
-            raise ValueError(
-                f"query_ctx_length {query_ctx_length} + past_kv_pos_offset {past_kv_pos_offset} != key_ctx_length {key_ctx_length} - you likely have a bug."
-            )
 
-        # Index back to front to ensure local attention works
-        final_mask = self.mask[None, None, -query_ctx_length:, -key_ctx_length:]  # [1, 1, pos, pos]
-        if attention_mask is not None:
-            # Apply a causal mask to the attention scores considering the padding
-            einsum_str = "batch head pos offset_pos, batch offset_pos -> batch head pos offset_pos"
-            final_mask = final_mask.to(attention_mask.device)
-            final_mask = einops.einsum(final_mask, attention_mask, einsum_str).bool()
-        extreme_negative_value = torch.tensor(-3.4028e+38)
-        attn_scores = attn_scores.to(final_mask.device)
-        return torch.where(final_mask, attn_scores, extreme_negative_value)
-    
-    # def calculate_qkv_matrices(
-    #     self,
-    #     hidden_state,
-    # ) -> Tuple[
-    #     Float[torch.Tensor, "batch pos head_index d_head"],
-    #     Float[torch.Tensor, "batch kv_pos head_index d_head"],
-    #     Float[torch.Tensor, "batch kv_pos head_index d_head"],
-    # ]:  
-    #     # import pdb
-    #     # print(value_input.shape, self.W_V.shape, self.b_V.shape)
-    #     # pdb.set_trace()
-    #     attn_fn = (
-    #         complex_attn_linear
-    #         if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
-    #         else simple_attn_linear
-    #     )
-        
-    #     q = self.hook_q(attn_fn(hidden_state, self.W_Q, self.b_Q))
-    #     k = self.hook_k(attn_fn(hidden_state, self.W_K, self.b_K))    
-    #     v = self.hook_v(attn_fn(hidden_state, self.W_V, self.b_V))
-        
-    #     return q, k, v
     
     def forward(
         self,

@@ -26,7 +26,8 @@ def load_models_and_processor(model_path):
         low_cpu_mem_usage=True
     )
     print("Vision model loaded.")
-    
+    vision_tower = vision_model.vision_tower
+    multi_modal_projector = vision_model.multi_modal_projector
     # 加载 HookedTransformer 语言模型
     hook_language_model = HookedLlava.from_pretrained(
         model_path,
@@ -37,6 +38,8 @@ def load_models_and_processor(model_path):
         center_unembed=False,
         tokenizer=None,
         dtype=torch.float32,
+        vision_tower=vision_tower,
+        multi_modal_projector=multi_modal_projector
     )
     # print(hook_language_model.state_dict().keys())
     # print(vision_model.language_model.state_dict().keys())
@@ -123,9 +126,7 @@ def process_image_and_generate_response(processor, vision_model, image_path):
     prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
     
     # 处理图像和文本输入
-    inputs = processor(images=image, text=prompt, return_tensors="pt").to("cuda:0")
-    import pdb
-    pdb.set_trace()
+    inputs = processor(images=image, text=prompt, return_tensors="pt")
     return inputs
 
 def main():
@@ -139,9 +140,8 @@ def main():
     image_path = "/aifs4su/yaodong/changye/TransformerLens/IMG_20230213_181559.jpg"
     inputs = process_image_and_generate_response(processor, vision_model, image_path)
 
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-    pixel_values = inputs["pixel_values"]
-    image_size = inputs["image_size"]
+    inputs=inputs.to("cuda:0")
+    outputs = hook_language_model.generate(inputs)
+    print(processor.decode(outputs[0], skip_special_tokens=True))
 if __name__ == "__main__":
     main()
