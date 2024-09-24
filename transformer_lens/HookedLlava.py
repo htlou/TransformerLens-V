@@ -179,6 +179,7 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
     height, width = select_best_resolution(image_size, grid_pinpoints)
     return height // patch_size, width // patch_size
 
+
 class HookedLlava(HookedRootModule):
     """Hooked Transformer.
 
@@ -226,7 +227,9 @@ class HookedLlava(HookedRootModule):
         self.padding_side = "left"
         self.pad_token_id=-1
         self.cfg = HookedTransformerConfig.unwrap(cfg)
-
+        
+        
+        
         if tokenizer is not None:
             self.set_tokenizer(tokenizer, default_padding_side=default_padding_side)
         elif self.cfg.tokenizer_name is not None:
@@ -266,9 +269,7 @@ class HookedLlava(HookedRootModule):
 
         self.embed = Embed(self.cfg)
         self.hook_embed = HookPoint()  # [batch, pos, d_model]
-        
         self.dtype = self.cfg.dtype
-
         if self.cfg.positional_embedding_type != "rotary":
             self.pos_embed = PosEmbed(self.cfg)
             self.hook_pos_embed = HookPoint()  # [batch, pos, d__dictmodel]
@@ -306,7 +307,6 @@ class HookedLlava(HookedRootModule):
 
         embed_std = 1/math.sqrt(self.cfg.d_model)
         self.image_newline = nn.Parameter(torch.randn(self.cfg.d_model,dtype=self.dtype) * embed_std)
-        
         
         if self.cfg.init_weights:
             self.init_weights()
@@ -352,6 +352,78 @@ class HookedLlava(HookedRootModule):
                 self.cfg.use_attn_in
             ), f"Cannot add hook {hook_point_name} if use_attn_in is False"
     
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_kv_cache=None,
+        inputs_embeds=None,
+        pixel_values=None,
+        image_sizes=None,
+        attention_mask=None,
+        use_kv_cache=True,
+        **kwargs,
+    ):
+        if past_kv_cache is not None:
+            if isinstance(past_kv_cache, HookedTransformerKeyValueCache):
+                cache_length = past_kv_cache.get_seq_length()
+                past_length =cache_length
+                # 这是一个经验性设置，不保证普遍正确性
+            else:
+                cache_length = past_length = past_kv_cache[0][0].shape[2]
+
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
+            # input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+            elif self.config.image_token_index in input_ids:
+                input_ids = input_ids[:, input_ids.shape[1] - 1 :]
+            # If the cache has seen more tokens than it can hold, then the cache has a size limit. Let's discard the
+            # older attention values, as their corresponding values are not part of the input.
+            if cache_length < past_length and attention_mask is not None:
+                attention_mask = attention_mask[:, -(cache_length + input_ids.shape[1]) :]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_kv_cache:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_kv_cache is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        if use_kv_cache:   
+            model_inputs.update(
+                {
+                    "position_ids": position_ids,
+                    "past_key_values": past_kv_cache,
+                    "attention_mask": attention_mask,
+                    "pixel_values": pixel_values,
+                    "image_sizes": image_sizes,
+                }
+            )
+        else:
+            model_inputs.update(
+                {
+                    "position_ids": position_ids,
+                    "attention_mask": attention_mask,
+                    "pixel_values": pixel_values,
+                    "image_sizes": image_sizes,
+                }
+            )
+        return model_inputs
+
     def input_to_embed(
         self,
         input: Union[str, List[str], Int[torch.Tensor, "batch pos"]],
@@ -749,6 +821,7 @@ class HookedLlava(HookedRootModule):
                 image_feature = image_feature.flatten(1, 2).flatten(2, 3)
                 image_feature = unpad_image(image_feature, image_sizes[image_idx])
                 if image_newline is not None:
+                    image_newline=image_newline.to(image_feature.device)
                     image_feature = torch.cat(
                         (
                             image_feature,
@@ -768,183 +841,123 @@ class HookedLlava(HookedRootModule):
         feature_lens = torch.tensor(feature_lens, dtype=torch.long, device=image_features.device)
         return image_features, feature_lens
     
-    def VL_to_embed(
+    def vision_embed(
         self,
-        input: Union[str, List[str], Int[torch.Tensor, "batch pos"]],
-        prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
-        padding_side: Optional[Union[Literal["left", "right"], None]] = USE_DEFAULT_VALUE,
+        input_ids: torch.LongTensor,
+        pixel_values: torch.FloatTensor = None,
+        image_sizes: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-        pixel_values:torch.Tensor = None,
-        image_sizes:torch.Tensor = None,
-    ) -> Tuple[
-        Float[torch.Tensor, "batch pos d_model"],  # residual
-        Optional[Int[torch.Tensor, "batch pos"]],  # tokens
-        Optional[Float[torch.Tensor, "batch pos d_model"]],  # shortformer_pos_embed
-        Optional[torch.Tensor],  # attention_mask [batch pos]
-    ]:
-      
-        position_ids=torch.arange(0, input.size(1), dtype=torch.long, device=input.device).unsqueeze(0)
-        tokens = input
-        if len(tokens.shape) == 1:
-            # If tokens are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
-            tokens = tokens[None]
-        if tokens.device.type != self.cfg.device:
-            tokens = tokens.to(devices.get_device_for_block_index(0, self.cfg))
-
-        if attention_mask is not None:
-            assert attention_mask.shape == tokens.shape, (
-                f"Attention mask shape {attention_mask.shape} does not match tokens shape "
-                f"{tokens.shape}"
-            )
-            attention_mask = attention_mask.to(devices.get_device_for_block_index(0, self.cfg))
-        elif (
-            self.tokenizer and self.tokenizer.padding_side == "left"
-        ) or past_kv_cache is not None:
-            # If the padding side is left or we are using caching, we need to compute the attention
-            # mask for the adjustment of absolute positional embeddings and attention masking so
-            # that pad tokens are not attended.
-
-            if prepend_bos is USE_DEFAULT_VALUE:
-                prepend_bos = self.cfg.default_prepend_bos
-            attention_mask = utils.get_attention_mask(self.tokenizer, tokens, prepend_bos)
-
-            if past_kv_cache is not None:
-                # past_kv_cache is not None, so we're doing caching.
-                # We need to extend the previous attention_mask.
-                # Update the past_kv_cache with the new attention_mask (unless it's frozen)
-                attention_mask = past_kv_cache.append_attention_mask(attention_mask)
-        else:
-            # We separate this case from for computational efficiency.
-            attention_mask = None
-
-        # If we're doing caching, then we reuse keys and values from previous runs, as that's the
-        # only way that past activations will affect the final logits. The cache contains those so
-        # we don't need to recompute them. This is useful for generating text. As we have absolute
-        # positional encodings, to implement this we have a `pos_offset` variable, defaulting to
-        # zero, which says to offset which positional encodings are used (cached keys and values
-        # were calculated with their own positional encodings).
-        if past_kv_cache is None:
-            pos_offset = 0
-        else:
-            batch_size, ctx_length = tokens.shape
-            (
-                cached_batch_size,
-                cache_ctx_length,
-                num_heads_in_cache,
-                d_head_in_cache,
-            ) = past_kv_cache[0].past_keys.shape
-            assert cached_batch_size == batch_size
-            if self.cfg.n_key_value_heads is None:
-                assert num_heads_in_cache == self.cfg.n_heads
-            else:
-                assert num_heads_in_cache == self.cfg.n_key_value_heads
-            assert d_head_in_cache == self.cfg.d_head
-            pos_offset = cache_ctx_length
-        if self.cfg.use_hook_tokens:
-            tokens = self.hook_tokens(tokens)
-        embed = self.hook_embed(self.embed(tokens))  # [batch, pos, d_model]
-        if self.cfg.positional_embedding_type == "standard":
-            pos_embed = self.hook_pos_embed(
-                self.pos_embed(tokens, pos_offset, attention_mask)
-            )  # [batch, pos, d_model]
-            residual = embed + pos_embed  # [batch, pos, d_model]
-            shortformer_pos_embed = None
-        elif self.cfg.positional_embedding_type == "shortformer":
-            # If we're using shortformer style attention, we don't add the positional embedding to
-            # the residual stream. See HookedTransformerConfig for details
-            pos_embed = self.hook_pos_embed(
-                self.pos_embed(tokens, pos_offset, attention_mask)
-            )  # [batch, pos, d_model]
-            residual = embed
-            shortformer_pos_embed = pos_embed
-        elif self.cfg.positional_embedding_type == "rotary":
-            # Rotary doesn't use positional embeddings, instead they're applied when dot producting
-            # keys and queries. See HookedTransformerConfig for details
-            residual = embed
-            shortformer_pos_embed = None
-        elif self.cfg.positional_embedding_type == "alibi":
-            # ALiBi does not add positional embeddings to word embeddings,instead it biases QK attention scores.
-            residual = embed
-            shortformer_pos_embed = None
-        else:
-            raise ValueError(
-                f"Invalid positional_embedding_type passed in {self.cfg.positional_embedding_type}"
-            )
-        
-        inputs_embeds = residual
-        #需要加载的
-        '''
-        image_size_to_num_patches() DONE
-            select_best_resolution()   (image_processing_utils.py) DONE
-        self.config.image_grid_pinpoints DONE
-        self.config.vision_config.image_size DONE
-        self.vision_tower DONE
-        self.multi_modal_projector DONE
-        pack_image_features() DONE
-        self.image_newline DONE
-        _merge_input_ids_with_image_features() DONE
-        self.config.image_token_index DONE
-        inputs_embeds.masked_scatter()  (torch)
-        '''
-        #-------------#
-
-            # if the number of image tokens is more than image embeddings seq length, then prob we expanded it in processing
-            # not very reliable, but we don't expect one to actually pass 500+ images for one prompt
-            # In case we're in decoding stage, legacy behavior is checked by presence of pixel values even if use_cache=True
-        if pixel_values is not None and tokens.shape[1] != 1 and pixel_values.size(0) > 0:
-            # ! infer image_num_patches from image_sizes
-            image_num_patches = [
-                image_size_to_num_patches(
-                    image_size=imsize,
-                    grid_pinpoints=self.cfg.image_grid_pinpoints,
-                    patch_size=self.cfg.vision_config["image_size"],
-                )
-                for imsize in image_sizes
-            ]
-            # figure out if pixel_values is concatenated or stacked
-            if pixel_values.dim() == 5:
-                # stacking when input is (batch_size, num_patches, num_channels, height, width)
-                _pixel_values_list = [
-                    pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        vision_feature_layer: Optional[int] = None,
+        vision_feature_select_strategy: Optional[str] = None,
+        labels: Optional[torch.LongTensor] = None,
+    ):  
+        device=input_ids.device
+        self.vision_tower = self.vision_tower.to(device)
+        self.multi_modal_projector = self.multi_modal_projector.to(device)
+        vision_feature_layer = (
+            vision_feature_layer if vision_feature_layer is not None else self.cfg.vision_feature_layer
+        )
+        vision_feature_select_strategy = (
+            vision_feature_select_strategy
+            if vision_feature_select_strategy is not None
+            else self.cfg.vision_feature_select_strategy
+        )
+        if pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) > 0:
+                # ! infer image_num_patches from image_sizes
+                image_num_patches = [
+                    image_size_to_num_patches(
+                        image_size=imsize,
+                        grid_pinpoints=self.cfg.image_grid_pinpoints,
+                        patch_size=self.cfg.vision_config["image_size"],
+                    )
+                    for imsize in image_sizes
                 ]
-                pixel_values = torch.cat(_pixel_values_list, dim=0)
-            elif pixel_values.dim() != 4:
-                # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
-                raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
+                # figure out if pixel_values is concatenated or stacked
+                if pixel_values.dim() == 5:
+                    # stacking when input is (batch_size, num_patches, num_channels, height, width)
+                    _pixel_values_list = [
+                        pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)
+                    ]
+                    pixel_values = torch.cat(_pixel_values_list, dim=0)
+                elif pixel_values.dim() != 4:
+                    # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
+                    raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
 
-            image_features = self.vision_tower(pixel_values, output_hidden_states=True)
-            selected_image_feature = image_features.hidden_states[self.cfg.vision_feature_layer]
-            
-            if self.cfg.vision_feature_select_strategy == "default":
-                selected_image_feature = selected_image_feature[:, 1:]
-            elif self.cfg.vision_feature_select_strategy == "full":
-                selected_image_feature = selected_image_feature
-            image_features = self.multi_modal_projector(selected_image_feature)
-            image_features = torch.split(image_features, image_num_patches, dim=0)
-            # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
-            image_features, feature_lens = self.pack_image_features(
-                image_features,
-                image_sizes,
-                image_newline=self.image_newline,
-            )
-            inputs_embeds = inputs_embeds.to(image_features.dtype)
-            inputs_embeds, attention_mask, position_ids, labels, _ = self._merge_input_ids_with_image_features(
+                image_features = self.vision_tower(pixel_values, output_hidden_states=True)
+                selected_image_feature = image_features.hidden_states[vision_feature_layer]
+
+                if vision_feature_select_strategy == "default":
+                    selected_image_feature = selected_image_feature[:, 1:]
+                elif vision_feature_select_strategy == "full":
+                    selected_image_feature = selected_image_feature
+
+                image_features = self.multi_modal_projector(selected_image_feature)
+
+                image_features = torch.split(image_features, image_num_patches, dim=0)
+
+                # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
+
+                image_features, feature_lens = self.pack_image_features(
+                    image_features,
+                    image_sizes,
+                    image_newline=self.image_newline,
+                )
+
+                inputs_embeds = inputs_embeds.to(image_features.dtype)
+                inputs_embeds, attention_mask, position_ids, labels, _ = self._merge_input_ids_with_image_features(
                     image_features,
                     feature_lens,
                     inputs_embeds,
-                    tokens,
+                    input_ids,
                     attention_mask,
                     position_ids,
+                    labels=labels,
                 )
-            # special_image_mask = (
-            #     (input == self.cfg.image_token_index).unsqueeze(-1).expand_as(inputs_embeds)
-            # )
-            # image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            # inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
-        
-        return inputs_embeds, tokens, shortformer_pos_embed, attention_mask
-    
+
+        # pixel_values is not None but is empty ---> text only cases
+        elif pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) == 0:
+                # there are no images
+                pass
+
+        # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
+        # generation with cache
+        elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
+                # Retrieve the first layer to inspect the logits and mask out the hidden states
+                # that are set to 0
+                # 如果出问题，可以确认以下是否应该传递的是key
+                first_layer_past_key_value = past_key_values[0].past_keys[:, :, :, 0]
+                first_layer_past_key_value=first_layer_past_key_value.transpose(1,2)
+                # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
+                batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
+
+                # Get the target length
+                target_length = input_ids.shape[1]
+                past_length = first_layer_past_key_value.shape[-1]
+
+                extended_attention_mask = torch.ones(
+                    (attention_mask.shape[0], past_length),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+
+                # Filter out only the tokens that can be un-attended, this can happen
+                # if one uses Llava + Fused modules where the cache on the
+                # first iteration is already big enough, or if one passes custom cache
+                valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
+                new_batch_index = batch_index[valid_indices]
+                new_non_attended_tokens = non_attended_tokens[valid_indices]
+
+                # Zero-out the places where we don't need to attend
+                extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
+
+                attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
+
+                position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
+        return attention_mask,position_ids,past_key_values,inputs_embeds,
+   
     @overload
     def forward(
         self,
@@ -1021,113 +1034,79 @@ class HookedLlava(HookedRootModule):
             Int[torch.Tensor, "batch pos"],
             Float[torch.Tensor, "batch pos d_model"],
         ],
-        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
-        pixel_values: Optional[torch.Tensor] = None,
-        image_sizes: Optional[torch.Tensor] = None,
         return_type: Optional[str] = "logits",
         loss_per_token: bool = False,
+        model_inputs: Optional[dict[str, torch.Tensor]] = None, 
         prepend_bos: Optional[Union[bool, None]] = USE_DEFAULT_VALUE,
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
         start_at_layer: Optional[int] = None,
         tokens: Optional[Int[torch.Tensor, "batch pos"]] = None,
         shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]] = None,
-
+        attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
+        image_sizes: Optional[int] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        vision:Optional[bool]=False,
+        
     ) -> Union[
         None,
         Float[torch.Tensor, "batch pos d_vocab"],
         Loss,
         Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss],
-    ]:
-        """Forward Pass.
-
-        Input is either a batch of tokens ([batch, pos]) or a text string, a string is automatically
-        tokenized to a batch of a single element. The prepend_bos flag only applies when inputting a
-        text string.
-
-        Note that loss is the standard "predict the next token" cross-entropy loss for GPT-2 style
-        language models - if you want a custom loss function, the recommended behaviour is returning
-        the logits and then applying your custom loss function.
-
-        Args:
-            return_type Optional[str]: The type of output to return. Can be one of: None (return
-                nothing, don't calculate logits), 'logits' (return logits), 'loss' (return
-                cross-entropy loss), 'both' (return logits and loss).
-            loss_per_token bool: Whether to return the (next token prediction) loss per token (True)
-                or average (False). Average loss is a scalar (averaged over position *and* batch),
-                per-token loss is a tensor ([batch, position-1]) - position-1 because we're
-                predicting the next token, and there's no specified next token for the final token.
-                Defaults to False.
-            prepend_bos Optional[bool]: Overrides self.cfg.default_prepend_bos. Whether to prepend
-                the BOS token to the input (only applies when input is a string). Defaults to None,
-                implying usage of self.cfg.default_prepend_bos which is set to True unless specified
-                otherwise. (Even for models not explicitly trained with a prepended BOS token, heads
-                often use the first position as a resting position and accordingly lose information
-                from the first token, so this empirically seems to give better results.) Pass True
-                or False to locally override the default.
-            padding_side Optional[Literal["left", "right"]]: Overrides self.tokenizer.padding_side.
-                Specifies which side to pad on when tokenizing multiple strings of different
-                lengths.
-            start_at_layer Optional[int]: If not None, start the forward pass at the specified
-                layer. Requires input to be the residual stream before the specified layer with
-                shape [batch, pos, d_model]. Inclusive - ie, start_at_layer = 0 skips the embedding
-                then runs the rest of the model. Supports negative indexing. start_at_layer = -1
-                only runs the final block and the unembedding. Defaults to None (run the full
-                model).
-            tokens: Optional[Int[torch.Tensor, "batch pos"]]: Tokenized input. Only use if
-                start_at_layer is not None and return type is "loss" or "both".
-            shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]]: Positional
-                embedding for shortformer models. Only use if start_at_layer is not None and
-                self.cfg.positional_embedding_type == "shortformer".
-            attention_mask: Optional[torch.Tensor]: Override the attention mask used to ignore
-                padded tokens. If start_at_layer is not None and (self.tokenizer.padding_side ==
-                "left" or past_kv_cache is not None), this should be passed as the attention mask
-                is not computed automatically. Defaults to None.
-            stop_at_layer Optional[int]: If not None, stop the forward pass at the specified layer.
-                Exclusive - ie, stop_at_layer = 0 will only run the embedding layer, stop_at_layer =
-                1 will run the embedding layer and the first transformer block, etc. Supports
-                negative indexing. Useful for analysis of intermediate layers, eg finding neuron
-                activations in layer 3 of a 24 layer model. Defaults to None (run the full model).
-                If not None, we return the last residual stream computed.
-            past_kv_cache Optional[HookedTransformerKeyValueCache]: If not None, keys and values
-                will be stored for every attention head (unless the cache is frozen). If there are
-                keys and values already in the cache, these will be prepended to the keys and values
-                for the new input, so that the new tokens can pay attention to previous tokens. This
-                is useful for generating text, because we don't need to repeat computation for
-                tokens that have already been through the model. Also caches attention_mask so
-                previous tokens are masked correctly (unless frozen). Padding should be ignored in
-                all cases, so it's okay to eg. pass in left padded tokens twice in a row.
-                Warning: Don't accidentally prepend_bos to the second half of a prompt.
-                Defaults to None (don't use caching).
-        """
-
+    ]:  
+        if vision:
+            # model_inputs={
+                #     "position_ids": position_ids,
+                #     "past_key_values": past_key_values,
+                #     "attention_mask": attention_mask,
+                #     "pixel_values": pixel_values,
+                #     "image_sizes": image_sizes,
+                # }
+            position_ids=model_inputs["position_ids"]
+            past_kv_cache=model_inputs["past_key_values"]
+            attention_mask=model_inputs["attention_mask"]
+            pixel_values=model_inputs["pixel_values"]
+            image_sizes=model_inputs["image_sizes"]
+            if not torch.equal(input, model_inputs["input_ids"]):
+                model_inputs["input_ids"]=input
+        
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
-        ):  
+        ):
             if start_at_layer is None:
                 (
                     residual,
                     tokens,
                     shortformer_pos_embed,
-                    attention_mask,
-                ) = self.VL_to_embed(
+                    _,
+                ) = self.input_to_embed(
                     input,
                     prepend_bos=prepend_bos,
                     padding_side=padding_side,
+                    attention_mask=None,
                     past_kv_cache=past_kv_cache,
-                    pixel_values=pixel_values,
-                    image_sizes=image_sizes,
-                    attention_mask=attention_mask,
                 )
+                if vision:
+                    # 第一次以后attention_mask长度不变，inputs_embeds长度为1
+                    attention_mask,position_ids,past_kv_cache,inputs_embeds = self.vision_embed(
+                        inputs_embeds=residual,
+                        pixel_values=pixel_values,
+                        image_sizes=image_sizes,
+                        attention_mask=attention_mask,
+                        past_key_values=past_kv_cache,
+                        input_ids=tokens,
+                        position_ids=position_ids,
+                    )
+                    residual=inputs_embeds
                 
             else:
                 assert type(input) == torch.Tensor
+                logging.warning("unexpected input type, not vision")
                 residual = input
-            '''
-            position_id
-            attention_mask
-            '''
+                
+            # residual=inputs_embeds
+
             if start_at_layer is None:
                 start_at_layer = 0
             # If we explicitly want to start or stop at a layer, we only iterate through the blocks
@@ -1146,6 +1125,7 @@ class HookedLlava(HookedRootModule):
                         devices.get_device_for_block_index(i, self.cfg)
                     )
                 # import pdb; pdb.set_trace()
+                print(residual.shape)
                 residual = block(
                     residual,
                     # Cache contains a list of HookedTransformerKeyValueCache objects, one for each
@@ -1183,7 +1163,6 @@ class HookedLlava(HookedRootModule):
                     else:
                         logging.warning(f"Invalid return_type passed in: {return_type}")
                         return None
-    
 
     def loss_fn(
         self,
@@ -1566,28 +1545,7 @@ class HookedLlava(HookedRootModule):
         Float[torch.Tensor, "pos d_model"],
         Float[torch.Tensor, "batch pos d_model"],
     ]:
-        """Map tokens to a tensor with the unembedding vector for those tokens.
-
-        I.e. the vector in the residual stream that we dot with to the get the logit for that token.
-
-        WARNING: If you use this without folding in LayerNorm, the results will be misleading and
-        may be incorrect, as the LN weights change the unembed map. This is done automatically with
-        the fold_ln flag on from_pretrained
-
-        WARNING 2: LayerNorm scaling will scale up or down the effective direction in the residual
-        stream for each output token on any given input token position.
-        ActivationCache.apply_ln_to_stack will apply the appropriate scaling to these directions.
-
-        Args:
-            tokens (Union[str, int, torch.Tensor]): The token(s). If a single token, can be a single
-                element tensor, an integer, or string. If string, will be mapped to a single token
-                using to_single_token, and an error raised if it's multiple tokens. The method also
-                works for a batch of input tokens.
-
-        Returns:
-            residual_direction torch.Tensor: The unembedding vector for the token(s), a stack of
-                [d_model] tensor.
-        """
+      
         if isinstance(tokens, torch.Tensor) and tokens.numel() > 1:
             # If the tokens are a tensor, and have more than one element, assume they are a batch of
             # tokens.
@@ -1659,145 +1617,12 @@ class HookedLlava(HookedRootModule):
         fold_value_biases: bool = True,
         default_prepend_bos: bool = True,
         default_padding_side: Literal["left", "right"] = "right",
-        vision_tower=None,
-        multi_modal_projector=None,
         dtype=torch.float32,
+        vision_tower=Optional[None],
+        multi_modal_projector=Optional[None],
         **from_pretrained_kwargs,
     ) -> "HookedTransformer":
-        """Load in a Pretrained Model.
-
-        Load in pretrained model weights to the HookedTransformer format and optionally to do some
-        processing to make the model easier to interpret. Currently supports loading from most
-        autoregressive HuggingFace models (``gpt2``, ``neo``, ``gptj``, ``opt``...) and from a range
-        of toy models and SoLU models trained by Neel Nanda. The full list is available in the docs
-        under :doc:`model properties</generated/model_properties_table>`. Also supports loading from
-        a checkpoint for checkpointed models (currently, models trained by NeelNanda and the
-        stanford-crfm models (using parameters ``checkpoint_index`` and ``checkpoint_value``).
-
-        See :meth:`load_and_process_state_dict` for details on the processing (folding layer norm,
-        centering the unembedding and centering the writing weights).
-
-        Example:
-
-        >>> from transformer_lens import HookedTransformer
-        >>> model = HookedTransformer.from_pretrained("tiny-stories-1M")
-        Loaded pretrained model tiny-stories-1M into HookedTransformer
-
-        Args:
-            model_name: The model name - must be an element of
-                :const:`transformer_lens.loading_from_pretrained.OFFICIAL_MODEL_NAMES` or an alias
-                of one. The full list of available models can be found in the docs under :doc:`model
-                properties</generated/model_properties_table>`.
-            fold_ln: Whether to fold in the LayerNorm weights to the
-                subsequent linear layer. This does not change the computation.
-
-                `LayerNorm
-                <https://wandb.ai/wandb_fc/LayerNorm/reports/Layer-Normalization-in-Pytorch-With-Examples---VmlldzoxMjk5MTk1>`_
-                is a common regularization technique used in transformers. Unlike BatchNorm, it
-                cannot be turned off at inference time, as it significantly alters the mathematical
-                function implemented by the transformer.
-
-                When `fold_ln` is set to True, LayerNorm (with weights :math:`w_{ln}` and
-                :math:`b_{ln}`) followed by a linear layer (:math:`W + b`) is optimized to
-                LayerNormPre (just centering & normalizing) followed by a new linear layer with
-                :math:`W_{eff} = w[:, \text{None}] * W` (element-wise multiplication) and
-                :math:`b_{eff} = b + b_{ln} @ W`. This transformation is computationally equivalent
-                and simplifies the model's interpretability. It essentially merges LayerNorm weights
-                into the subsequent linear layer's weights, which is handled by HookedTransformer
-                when loading pre-trained weights. Set `fold_ln` to False when loading a state dict
-                if you wish to turn this off.
-
-                Mathematically, LayerNorm is defined as follows:
-
-                .. math::
-                    x_1 &= x_0 - \\text{mean}(x_0)
-
-                    x_2 &= \\frac{x_1}{\\sqrt{\\text{mean}(x_1^2)}}
-
-                    x_3 &= x_2 \\cdot w
-
-                    x_4 &= x_3 + b
-
-                For further details, refer to `this document
-                <https://transformer-circuits.pub/2021/framework/index.html#:~:text=Handling%20Layer%20Normalization>`_.
-            center_writing_weights: Whether to center weights
-                writing to the residual stream (ie set mean to be zero). Due to LayerNorm this
-                doesn't change the computation.
-
-                A related idea to folding layernorm (``fold_ln``) - *every* component reading an
-                input from the residual stream is preceded by a LayerNorm, which means that the mean
-                of a residual stream vector (ie the component in the direction of all ones) never
-                matters. This means we can remove the all ones component of weights and biases whose
-                output *writes* to the residual stream. Mathematically, ``W_writing -=
-                W_writing.mean(dim=1, keepdim=True)``.
-            center_unembed: Whether to center W_U (ie set mean
-                to be zero). Softmax is translation invariant so this doesn't affect log probs or
-                loss, but does change logits.
-
-                The logits are fed into a softmax. Softmax is translation invariant (eg, adding 1 to
-                every logit doesn't change the output), so we can simplify things by setting the
-                mean of the logits to be zero. This is equivalent to setting the mean of every
-                output vector of ``W_U`` to zero. In code, ``W_U -= W_U.mean(dim=-1,
-                keepdim=True)``.
-            refactor_factored_attn_matrices: Whether to convert the factored
-                matrices (W_Q & W_K, and W_O & W_V) to be "even". Defaults to False
-            checkpoint_index: If loading from a checkpoint, the index of
-                the checkpoint to load.
-            checkpoint_value: If loading from a checkpoint, the value of
-                the checkpoint to load, ie the step or token number (each model has checkpoints
-                labelled with exactly one of these). E.g. ``1000`` for a checkpoint taken at step
-                1000 or after 1000 tokens. If `checkpoint_index` is also specified, this will be
-                ignored.
-            hf_model: If you have already loaded in the
-                HuggingFace model, you can pass it in here rather than needing to recreate the
-                object. Defaults to None.
-            device: The device to load the model onto. By
-                default will load to CUDA if available, else CPU.
-            n_devices: The number of devices to split the model
-                across. Defaults to 1. If greater than 1, `device` must be cuda.
-            tokenizer: The tokenizer to use for the model. If not
-                provided, it is inferred from cfg.tokenizer_name or initialized to None. If None,
-                then the model cannot be passed strings, and d_vocab must be explicitly set.
-            move_to_device: Whether to move the model to the device specified in
-                cfg. device. Must be true if `n_devices` in the config is greater than 1, since the
-                model's layers will be split across multiple devices.
-            fold_value_biases: Each attention head has a value bias. Values are averaged to create
-                mixed values (``z``), weighted by the attention pattern, but as the bias is
-                constant, its contribution to ``z`` is exactly the same. The output of a head is ``z
-                @ W_O``, and so the value bias just linearly adds to the output of the head. This
-                means that the value bias of a head has nothing to do with the head, and is just a
-                constant added to the attention layer outputs. We can take the sum across these and
-                b_O to get an "effective bias" for the layer. In code, we set ``b_V=0``. and ``b_O =
-                (b_V @ W_O).sum(dim=0) + b_O``.
-
-                The technical derivation of this is as follows. ``v = residual @ W_V[h] +
-                broadcast_b_V[h]`` for each head ``h`` (where ``b_V`` is broadcast up from shape
-                ``d_head`` to shape ``[position, d_head]``). And ``z = pattern[h] @ v = pattern[h] @
-                residual @ W_V[h] + pattern[h] @ broadcast_b_V[h]``. Because ``pattern[h]`` is
-                ``[destination_position, source_position]`` and ``broadcast_b_V`` is constant along
-                the ``(source_)position`` dimension, we're basically just multiplying it by the sum
-                of the pattern across the ``source_position`` dimension, which is just ``1``. So it
-                remains exactly the same, and so is just broadcast across the destination positions.
-            default_prepend_bos: Default behavior of whether to prepend the BOS
-                token when the methods of HookedTransformer process input text to tokenize (only
-                when input is a string). Defaults to True - even for models not explicitly trained
-                with this, heads often use the first position as a resting position and accordingly
-                lose information from the first token, so this empirically seems to give better
-                results. To change the default behavior to False, pass in default_prepend_bos=False.
-                Note that you can also locally override the default behavior by passing in
-                prepend_bos=True/False when you call a method that processes the input string.
-            from_pretrained_kwargs: Any other optional argument passed to
-                HuggingFace's from_pretrained (e.g. "cache_dir" or "torch_dtype"). Also passed to
-                other HuggingFace functions when compatible. For some models or arguments it doesn't
-                work, especially for models that are not internally loaded with HuggingFace's
-                from_pretrained (e.g. SoLU models).
-            dtype: What data type to load the model in (also sets the dtype of
-                the HuggingFace model). Set to bfloat16 or float16 if you get out of memory errors when loading
-                the model.
-            default_padding_side: Which side to pad on when tokenizing. Defaults to
-                "right".
-        """
-
+        
 
         assert not (
             from_pretrained_kwargs.get("load_in_8bit", False)
@@ -1858,7 +1683,6 @@ class HookedLlava(HookedRootModule):
             dtype=dtype,
             **from_pretrained_kwargs,
         )
-
         # pdb.set_trace()
         if cfg.positional_embedding_type == "shortformer":
             if fold_ln:
@@ -1913,8 +1737,9 @@ class HookedLlava(HookedRootModule):
             model.move_model_modules_to_device()
 
         print(f"Loaded pretrained model {model_name} into HookedTransformer")
-        model.vision_tower=vision_tower
-        model.multi_modal_projector=multi_modal_projector
+        if vision_tower != None:
+            model.vision_tower=vision_tower
+            model.multi_modal_projector=multi_modal_projector
         return model
 
     @classmethod
@@ -2578,6 +2403,8 @@ class HookedLlava(HookedRootModule):
             refactor_factored_attn_matrices=refactor_factored_attn_matrices,
         )
 
+    
+    
     @torch.inference_mode()
     def generate(
         self,
@@ -2596,95 +2423,39 @@ class HookedLlava(HookedRootModule):
         return_type: Optional[str] = "input",
         verbose: bool = True,
     ) -> Union[Int[torch.Tensor, "batch pos_plus_new_tokens"], str]:
-        
-        """Sample Tokens from the Model.
-
-        Sample tokens from the model until the model outputs eos_token or max_new_tokens is reached.
-
-        To avoid fiddling with ragged tensors, if we input a batch of text and some sequences finish
-        (by producing an EOT token), we keep running the model on the entire batch, but throw away
-        the output for a finished sequence and just keep adding EOTs to pad.
-
-        This supports entering a single string, but not a list of strings - if the strings don't
-        tokenize to exactly the same length, this gets messy. If that functionality is needed,
-        convert them to a batch of tokens and input that instead.
-
-        Args:
-            input (Union[str, Int[torch.Tensor, "batch pos"])]): Either a batch of tokens ([batch,
-                pos]) or a text string (this will be converted to a batch of tokens with batch size
-                1).
-            max_new_tokens (int): Maximum number of tokens to generate.
-            stop_at_eos (bool): If True, stop generating tokens when the model outputs eos_token.
-            eos_token_id (Optional[Union[int, Sequence]]): The token ID to use for end
-                of sentence. If None, use the tokenizer's eos_token_id - required if using
-                stop_at_eos. It's also possible to provide a list of token IDs (not just the
-                eos_token_id), in which case the generation will stop when any of them are output
-                (useful e.g. for stable_lm).
-            do_sample (bool): If True, sample from the model's output distribution. Otherwise, use
-                greedy search (take the max logit each time).
-            top_k (int): Number of tokens to sample from. If None, sample from all tokens.
-            top_p (float): Probability mass to sample from. If 1.0, sample from all tokens. If <1.0,
-                we take the top tokens with cumulative probability >= top_p.
-            temperature (float): Temperature for sampling. Higher values will make the model more
-                random (limit of temp -> 0 is just taking the top token, limit of temp -> inf is
-                sampling from a uniform distribution).
-            freq_penalty (float): Frequency penalty for sampling - how much to penalise previous
-                tokens. Higher values will make the model more random.
-            use_past_kv_cache (bool): If True, create and use cache to speed up generation.
-            prepend_bos (bool, optional): Overrides self.cfg.default_prepend_bos. Whether to prepend
-                the BOS token to the input (applicable when input is a string). Defaults to None,
-                implying usage of self.cfg.default_prepend_bos (default is True unless specified
-                otherwise). Pass True or False to override the default.
-            padding_side (Union[Literal["left", "right"], None], optional): Overrides
-                self.tokenizer.padding_side. Specifies which side to pad when tokenizing multiple
-                strings of different lengths.
-            return_type (Optional[str]): The type of the output to return - either a string (str),
-                a tensor of tokens (tensor) or whatever the format of the input was (input).
-            verbose (bool): If True, show tqdm progress bars for generation.
-
-        Returns:
-            outputs (torch.Tensor): [batch, pos + max_new_tokens], generated sequence of new tokens
-                (by default returns same type as input).
-        """
 
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
         ):
-            # if type(input) == str:
-            #     # If text, convert to tokens (batch_size=1)
-            #     assert (
-            #         self.tokenizer is not None
-            #     ), "Must provide a tokenizer if passing a string to the model"
-            #     tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
-            # else:
-            #     tokens = input
-            input_ids=inputs["input_ids"]
-            vision=True
-            if "attention_mask" in inputs:
-                attention_mask=inputs["attention_mask"]
-            if "pixel_values" in inputs:
-                pixel_values=inputs["pixel_values"]
-            else:
-                vision=False
-            if "image_sizes" in inputs:
-                image_sizes=inputs["image_sizes"]
-            
-            # if return_type == "input":
-            #     if type(input) == str:
-            #         return_type = "str"
-            #     else:
-            #         return_type = "tensor"
-            return_type = "str"
-            
-            assert isinstance(input_ids, torch.Tensor)
-            batch_size, ctx_length = input_ids.shape
+            input_ids=inputs.get("input_ids",inputs)
+            vision=False
+            attention_mask = inputs.get("attention_mask", None)
+            pixel_values = inputs.get("pixel_values", None)
+            image_sizes = inputs.get("image_sizes", None)
+            if input_ids==inputs:
+                if type(inputs) == str:
+                    # If text, convert to tokens (batch_size=1)
+                    assert (
+                        self.tokenizer is not None
+                    ), "Must provide a tokenizer if passing a string to the model"
+                    tokens = self.to_tokens(inputs, prepend_bos=prepend_bos, padding_side=padding_side)
+                else:
+                    tokens = inputs
+
+                if return_type == "input":
+                    if type(inputs) == str:
+                        return_type = "str"
+                    else:
+                        return_type = "tensor"
+            else:   
+                tokens=input_ids
+                vision=True
+                return_type = "tensor"
+
+            assert isinstance(tokens, torch.Tensor)
+            batch_size, ctx_length = tokens.shape
             device = devices.get_device_for_block_index(0, self.cfg)
-            tokens = input_ids.to(device)
-            if vision:
-                attention_mask = attention_mask.to(device)
-                pixel_values = pixel_values.to(device)
-                image_sizes = image_sizes.to(device)
-            
+            tokens = tokens.to(device)
             if use_past_kv_cache:
                 past_kv_cache = HookedTransformerKeyValueCache.init_cache(
                     self.cfg, self.cfg.device, batch_size
@@ -2726,15 +2497,42 @@ class HookedLlava(HookedRootModule):
                 # While generating, we keep generating logits, throw away all but the final logits,
                 # and then use those logits to sample from the distribution We keep adding the
                 # sampled tokens to the end of tokens.
-
+                if vision:
+                    model_inputs=self.prepare_inputs_for_generation(tokens, past_kv_cache=past_kv_cache, image_sizes=image_sizes, attention_mask=attention_mask, pixel_values=pixel_values, vision=vision,use_kv_cache=use_past_kv_cache)
+                    attention_mask=torch.cat([attention_mask,torch.ones((batch_size,1),device=device)],dim=1)
+                # model_inputs={
+                #     "position_ids": position_ids,
+                #     "past_key_values": past_key_values,
+                #     "attention_mask": attention_mask,
+                #     "pixel_values": pixel_values,
+                #     "image_sizes": image_sizes,
+                # }
+                
                 if use_past_kv_cache:
                     # We just take the final tokens, as a [batch, 1] tensor
-                    if index > 0:
-                        if vision:
+                    if vision:
+                        if index > 0:
                             logits = self.forward(
                                 tokens[:, -1:],
-                                pixel_values=pixel_values,
-                                image_sizes=image_sizes,
+                                return_type="logits",
+                                prepend_bos=prepend_bos,
+                                padding_side=padding_side,
+                                model_inputs=model_inputs,
+                                vision=vision,
+                            )
+                        else:
+                            logits = self.forward(
+                                tokens,
+                                return_type="logits",
+                                prepend_bos=prepend_bos,
+                                padding_side=padding_side,
+                                model_inputs=model_inputs,
+                                vision=vision,
+                            )
+                    else:
+                        if index > 0:
+                            logits = self.forward(
+                                tokens[:, -1:],
                                 return_type="logits",
                                 prepend_bos=prepend_bos,
                                 padding_side=padding_side,
@@ -2742,51 +2540,23 @@ class HookedLlava(HookedRootModule):
                             )
                         else:
                             logits = self.forward(
-                                tokens[:, -1:],
-                                return_type="logits",
-                                prepend_bos=prepend_bos,
-                                padding_side=padding_side,
-                                past_kv_cache=past_kv_cache,
-                            )
-                    else:
-                        if vision:
-                            logits = self.forward(
-                                    tokens,
-                                    pixel_values=pixel_values,
-                                    image_sizes=image_sizes,
-                                    return_type="logits",
-                                    prepend_bos=prepend_bos,
-                                    padding_side=padding_side,
-                                    attention_mask=attention_mask,
-                                )
-                        else: 
-                            logits = self.forward(
                                 tokens,
                                 return_type="logits",
                                 prepend_bos=prepend_bos,
                                 padding_side=padding_side,
-                                past_kv_cache=past_kv_cache,
+                                past_kv_cache=past_kv_cache,        
                             )
                 else:
                     # We input the entire sequence, as a [batch, pos] tensor, since we aren't using
                     # the cache.
-                    if vision:
-                        logits = self.forward(
-                                tokens,
-                                attention_mask=attention_mask,
-                                pixel_values=pixel_values,
-                                image_sizes=image_sizes,
-                                return_type="logits",
-                                prepend_bos=prepend_bos,
-                                padding_side=padding_side,
-                            )
-                    else:
-                        logits = self.forward( 
-                            tokens,
-                            return_type="logits",
-                            prepend_bos=prepend_bos,
-                            padding_side=padding_side,
-                        )
+                    
+                    # no cache no vision
+                    logits = self.forward(
+                        tokens,
+                        return_type="logits",
+                        prepend_bos=prepend_bos,
+                        padding_side=padding_side,
+                    )
                 final_logits = logits[:, -1, :]
 
                 if do_sample:
@@ -2820,15 +2590,15 @@ class HookedLlava(HookedRootModule):
                 if stop_at_eos and finished_sequences.all():
                     break
 
-            # if return_type == "str":
-            #     if self.cfg.default_prepend_bos:
-            #         # If we prepended a BOS token, remove it when returning output.
-            #         return self.tokenizer.decode(tokens[0, 1:])
-            #     else:
-            #         return self.tokenizer.decode(tokens[0])
+            if return_type == "str":
+                if self.cfg.default_prepend_bos:
+                    # If we prepended a BOS token, remove it when returning output.
+                    return self.tokenizer.decode(tokens[0, 1:])
+                else:
+                    return self.tokenizer.decode(tokens[0])
 
-            # else:
-            return tokens
+            else:
+                return tokens
 
     # Give access to all weights as properties.
     @property

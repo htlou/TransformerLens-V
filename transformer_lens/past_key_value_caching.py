@@ -74,7 +74,8 @@ class HookedTransformerKeyValueCache:
         cfg: HookedTransformerConfig,
         device: Union[torch.device, str, None],
         batch_size: int = 1,
-    ):
+    ):  
+        
         return cls(
             entries=[
                 HookedTransformerKeyValueCacheEntry.init_cache_entry(
@@ -113,3 +114,11 @@ class HookedTransformerKeyValueCache:
 
     def __getitem__(self, idx):
         return self.entries[idx]
+    def get_seq_length(self):
+        return self.previous_attention_mask.size(1)
+    @property
+    def seen_tokens(self):
+        if hasattr(self, "_seen_tokens"):
+            return self._seen_tokens
+        else:
+            return None

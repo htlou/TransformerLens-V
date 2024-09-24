@@ -59,35 +59,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-class MistralRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    @torch.no_grad()
-    # copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding.forward
-    # TODO(joao): add me back asap :)
-    def forward(self, x, position_ids):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 since bfloat16 loses precision on long contexts
-        # See https://github.com/huggingface/transformers/pull/29285
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-    
-
 class MistralAttention(AbstractAttention):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
@@ -135,9 +106,6 @@ class MistralAttention(AbstractAttention):
         # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.layer_id=layer_id
-        self.rotary_emb = MistralRotaryEmbedding(
-            self.cfg.d_head, max_position_embeddings=self.cfg.max_position_embeddings, base=self.cfg.rotary_base
-        )
         self.hook_k = HookPoint()  # [batch, pos, head_index, d_head]
         self.hook_q = HookPoint()  # [batch, pos, head_index, d_head]
         self.hook_v = HookPoint()  # [batch, pos, head_index, d_head]
@@ -145,35 +113,6 @@ class MistralAttention(AbstractAttention):
         self.hook_attn_scores = HookPoint()  # [batch, head_index, query_pos, key_pos]
         self.hook_pattern = HookPoint()  # [batch, head_index, query_pos, key_pos]
         self.hook_result = HookPoint()  # [batch, pos, head_index, d_model]
-        
-    # def apply_rotary(
-    #     self,
-    #     x: Float[torch.Tensor, "batch pos head_index d_head"],
-    #     past_kv_pos_offset=0,
-    #     attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
-    # ) -> Float[torch.Tensor, "batch pos head_index d_head"]:
-    #     # Only apply rotary to first rotary_dim dimensions (eg, if rotary_dim=64 and d_head=256, only apply to first 1/4 of dimensions)
-    #     x_pos = x.size(1)
-    #     x_rot = x[..., : self.cfg.rotary_dim]
-    #     x_pass = x[..., self.cfg.rotary_dim :]
-    #     x_flip = self.rotate_every_two(x_rot)
-
-    #     if attention_mask is None:
-    #         rotary_cos = self.rotary_cos[
-    #             None, past_kv_pos_offset : past_kv_pos_offset + x_pos, None, :
-    #         ]
-    #         rotary_sin = self.rotary_sin[
-    #             None, past_kv_pos_offset : past_kv_pos_offset + x_pos, None, :
-    #         ]
-    #         x_rotated = x_rot * rotary_cos + x_flip * rotary_sin
-    #     else:
-    #         offset_position_ids = get_offset_position_ids(past_kv_pos_offset, attention_mask)
-    #         offset_position_ids = offset_position_ids.to(self.rotary_cos.device)
-    #         mask_rotary_cos = self.rotary_cos[offset_position_ids, None, :]
-    #         mask_rotary_sin = self.rotary_sin[offset_position_ids, None, :]
-    #         x_rotated = x_rot * mask_rotary_cos + x_flip * mask_rotary_sin
-
-    #     return torch.cat([x_rotated, x_pass], dim=-1)
 
     def calculate_attention_scores(
         self,
@@ -192,64 +131,8 @@ class MistralAttention(AbstractAttention):
         #         attn_scores / self.cfg.attn_scores_soft_cap
         #     )
         return attn_scores
-    def apply_causal_mask(
-        self,
-        attn_scores: Float[torch.Tensor, "batch head_index pos pos_plus_past_kv_pos_offset"],
-        past_kv_pos_offset: int = 0,
-        attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
-    ):
-        # The query context length is the number of positions we take queries from - if not using a past_kv_cache this is just the context length (for the current prompt), but if we're caching it can be different.
-        query_ctx_length = attn_scores.size(-2)
-        # The key context length is the number of positions in the past - this includes all positions in the cache
-        # If not caching, query_ctx_length == key_ctx_length
-        key_ctx_length = attn_scores.size(-1)
 
-        if query_ctx_length + past_kv_pos_offset != key_ctx_length:
-            raise ValueError(
-                f"query_ctx_length {query_ctx_length} + past_kv_pos_offset {past_kv_pos_offset} != key_ctx_length {key_ctx_length} - you likely have a bug."
-            )
-        self.mask = torch.triu(
-            torch.ones(
-                query_ctx_length,
-                key_ctx_length,
-                device=attn_scores.device,
-                dtype=torch.bool,
-            ),
-            diagonal=1,
-        )
-        # Index back to front to ensure local attention works
-        final_mask = self.mask[None, None, -query_ctx_length:, -key_ctx_length:]  # [1, 1, pos, pos]
-        if attention_mask is not None:
-            # Apply a causal mask to the attention scores considering the padding
-            einsum_str = "batch head pos offset_pos, batch offset_pos -> batch head pos offset_pos"
-            final_mask = final_mask.to(attention_mask.device)
-            final_mask = einops.einsum(final_mask, attention_mask, einsum_str).bool()
-        extreme_negative_value = torch.tensor(-3.4028e+38)
-        attn_scores = attn_scores.to(final_mask.device)
-        return torch.where(final_mask, attn_scores, extreme_negative_value)
-    
-    # def calculate_qkv_matrices(
-    #     self,
-    #     hidden_state,
-    # ) -> Tuple[
-    #     Float[torch.Tensor, "batch pos head_index d_head"],
-    #     Float[torch.Tensor, "batch kv_pos head_index d_head"],
-    #     Float[torch.Tensor, "batch kv_pos head_index d_head"],
-    # ]:  
-    #     # import pdb
-    #     # print(value_input.shape, self.W_V.shape, self.b_V.shape)
-    #     # pdb.set_trace()
-    #     attn_fn = (
-    #         complex_attn_linear
-    #         if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
-    #         else simple_attn_linear
-    #     )
-        
-    #     q = self.hook_q(attn_fn(hidden_state, self.W_Q, self.b_Q))
-    #     k = self.hook_k(attn_fn(hidden_state, self.W_K, self.b_K))    
-    #     v = self.hook_v(attn_fn(hidden_state, self.W_V, self.b_V))
-        
-    #     return q, k, v
+
     
     def forward(
         self,
@@ -286,35 +169,30 @@ class MistralAttention(AbstractAttention):
         else:
             # Not using a cache
             kv_cache_pos_offset = 0
-        # if self.cfg.positional_embedding_type == "rotary":
-        #     q = self.hook_rot_q(self.apply_rotary(q, kv_cache_pos_offset, attention_mask))
-        #     k = self.hook_rot_k(
-        #         self.apply_rotary(k, 0, attention_mask)
-        #     )  # keys are cached so no offset
-        # q = einops.rearrange(
-        #     q, "batch query_pos head_index d_head -> batch head_index query_pos d_head"
-        # )
-        q=q.transpose(1, 2).contiguous()
-        k=k.transpose(1, 2).contiguous()
-        v=v.transpose(1, 2).contiguous()
-        position_ids = torch.arange(0,hidden_state.size(1),device=hidden_state.device).unsqueeze(0)
-        cos,sin=self.rotary_emb(v,position_ids)
-        q,k=apply_rotary_pos_emb(q,k,cos,sin,position_ids)
+        if self.cfg.positional_embedding_type == "rotary":
+            q = self.hook_rot_q(self.apply_rotary(q, kv_cache_pos_offset, attention_mask))
+            k = self.hook_rot_k(
+                self.apply_rotary(k, 0, attention_mask)
+            )  # keys are cached so no offset
+        
 
         if self.cfg.dtype not in [torch.float32, torch.float64]:
             # If using 16 bits, increase the precision to avoid numerical instabilities
             q = q.to(torch.float32)
             k = k.to(torch.float32)
-
+        k=k.transpose(1, 2).contiguous()
+        v=v.transpose(1, 2).contiguous()
         k=repeat_kv(k, self.cfg.n_heads//self.cfg.n_key_value_heads)
         v=repeat_kv(v, self.cfg.n_heads//self.cfg.n_key_value_heads)
         # import pdb
         # pdb.set_trace()
-
+        q_ = einops.rearrange(
+            q, "batch query_pos head_index d_head -> batch head_index query_pos d_head"
+        )
         # k_ = einops.rearrange(
         #     k, "batch key_pos head_index d_head -> batch head_index d_head key_pos"
         # )
-        attn_scores = torch.matmul(q,k.transpose(2,3)) /math.sqrt(self.cfg.d_head)
+        attn_scores = torch.matmul(q_,k.transpose(2,3)) /math.sqrt(self.cfg.d_head)
         # attn_scores = self.calculate_attention_scores(
         #     q, k
         # )  # [batch, head_index, query_pos, key_pos]

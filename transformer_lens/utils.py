@@ -951,6 +951,7 @@ def get_offset_position_ids(
     # Set the position ids of all prepending pad tokens to an arbitrary number (zero here)
     # just to avoid indexing errors.
     position_ids = shifted_position_ids.masked_fill(shifted_position_ids < 0, 0)
+    position_ids = position_ids.to(torch.long)
     return position_ids[:, past_kv_pos_offset:]  # [pos, batch]
 
 
