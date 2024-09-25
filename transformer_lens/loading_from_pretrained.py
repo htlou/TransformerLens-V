@@ -42,6 +42,7 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_qwen_weights,
     convert_t5_weights,
     convert_mistral_v0_2_weights,
+    convert_chameleon_weights,
 )
 
 OFFICIAL_MODEL_NAMES = [
@@ -226,8 +227,8 @@ OFFICIAL_MODEL_NAMES = [
     "google-t5/t5-base",
     "google-t5/t5-large",
     "ai-forever/mGPT",
-    
     "llava-hf/llava-v1.6-mistral-7b-hf"
+    "htlou/AA-Chameleon-7B-plus",
 ]
 """Official model names for models on HuggingFace."""
 
@@ -652,6 +653,8 @@ MODEL_ALIASES = {
     "google-t5/t5-base": ["t5-base"],
     "google-t5/t5-large": ["t5-large"],
     "ai-forever/mGPT": ["mGPT"],
+    "facebook/chameleon-7b": ["meta-chameleon"],
+    "htlou/AA-Chameleon-7B-plus": ["chameleon"],
 }
 """Model aliases for models on HuggingFace."""
 
@@ -1333,6 +1336,25 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "use_attn_scale": False,
             "tie_word_embeddings": hf_config.tie_word_embeddings,
         }
+    elif architecture == "ChameleonForConditionalGeneration":
+        cfg_dict = {
+            "d_model": hf_config.hidden_size,
+            "d_head": hf_config.hidden_size // hf_config.num_attention_heads,
+            "n_heads": hf_config.num_attention_heads,
+            "d_mlp": hf_config.intermediate_size,
+            "n_layers": hf_config.num_hidden_layers,
+            "n_ctx": hf_config.max_position_embeddings,
+            "eps": hf_config.rms_norm_eps,
+            "d_vocab": hf_config.vocab_size,
+            "act_fn": hf_config.hidden_act,
+            "rotary_base": hf_config.rope_theta,
+            "normalization_type": "RMS",
+            "positional_embedding_type": "rotary",
+            "rotary_adjacent_pairs": False,
+            "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
+            "final_rms": True,
+            "gated_mlp": True,
+        }
     else:
         raise NotImplementedError(f"{architecture} is not currently supported.")
     # All of these models use LayerNorm
@@ -1446,6 +1468,7 @@ def get_pretrained_model_config(
     n_devices: int = 1,
     default_prepend_bos: bool = True,
     dtype: torch.dtype = torch.float32,
+    first_n_layers: Optional[int] = None,
     **kwargs,
 ):
     """Returns the pretrained model config as an HookedTransformerConfig object.
@@ -1562,6 +1585,8 @@ def get_pretrained_model_config(
     cfg_dict["default_prepend_bos"] = default_prepend_bos
     if hf_cfg is not None:
         cfg_dict["load_in_4bit"] = hf_cfg.get("quantization_config", {}).get("load_in_4bit", False)
+    if first_n_layers is not None:
+        cfg_dict["n_layers"] = first_n_layers
 
     cfg = HookedTransformerConfig.from_dict(cfg_dict)
     return cfg
@@ -1777,6 +1802,8 @@ def get_pretrained_state_dict(
             state_dict = convert_gemma_weights(hf_model, cfg)
         elif cfg.original_architecture == "Gemma2ForCausalLM":
             state_dict = convert_gemma_weights(hf_model, cfg)
+        elif cfg.original_architecture == "ChameleonForConditionalGeneration":
+            state_dict = convert_chameleon_weights(hf_model, cfg)
         else:
             raise ValueError(
                 f"Loading weights from the architecture is not currently supported: {cfg.original_architecture}, generated from model name {cfg.model_name}. Feel free to open an issue on GitHub to request this feature."

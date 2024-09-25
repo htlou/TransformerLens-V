@@ -109,6 +109,7 @@ class TransformerBlock(nn.Module):
         shortformer_pos_embed: Optional[Float[torch.Tensor, "batch pos d_model"]] = None,
         past_kv_cache_entry: Optional[HookedTransformerKeyValueCacheEntry] = None,
         attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
+        output_attentions: Optional[bool] = False,
     ) -> Float[torch.Tensor, "batch pos d_model"]:
         """A single Transformer block.
 
@@ -141,6 +142,7 @@ class TransformerBlock(nn.Module):
             n_kv_heads = (
                 self.cfg.n_key_value_heads
                 if self.cfg.n_key_value_heads is not None
+                and not self.cfg.ungroup_grouped_query_attention
                 else self.cfg.n_heads
             )
             query_input = self.hook_q_input(
@@ -156,12 +158,25 @@ class TransformerBlock(nn.Module):
             query_input = attn_in
             key_input = attn_in
             value_input = attn_in
-        # import pdb; pdb.set_trace()
-        attn_out = (
-            # hook the residual stream states that are used to calculate the
-            # queries, keys and values, independently.
-            # Then take the layer norm of these inputs, and pass these to the attention module.
-            self.attn(
+        
+        output_attention = None
+        if output_attentions:
+            attn_out, output_attention = (
+                # hook the residual stream states that are used to calculate the
+                # queries, keys and values, independently.
+                # Then take the layer norm of these inputs, and pass these to the attention module.
+                self.attn.forward_with_attn_weights(
+                    query_input=self.ln1(query_input)
+                    + (0.0 if shortformer_pos_embed is None else shortformer_pos_embed),
+                    key_input=self.ln1(key_input)
+                    + (0.0 if shortformer_pos_embed is None else shortformer_pos_embed),
+                    value_input=self.ln1(value_input),
+                    past_kv_cache_entry=past_kv_cache_entry,
+                    attention_mask=attention_mask,
+                )
+            )  # [batch, pos, d_model], [batch, head_index, pos, kv_pos]
+        else:
+            attn_out = self.attn(
                 query_input=self.ln1(query_input)
                 + (0.0 if shortformer_pos_embed is None else shortformer_pos_embed),
                 key_input=self.ln1(key_input)
@@ -170,7 +185,6 @@ class TransformerBlock(nn.Module):
                 past_kv_cache_entry=past_kv_cache_entry,
                 attention_mask=attention_mask,
             )
-        )  # [batch, pos, d_model]
         if self.cfg.use_normalization_before_and_after:
             # If we use LayerNorm both before and after, then apply the second LN after the layer
             # and before the hook. We do it before the hook so hook_attn_out captures "that which
@@ -197,7 +211,10 @@ class TransformerBlock(nn.Module):
             )  # [batch, pos, d_model]
         else:
             resid_post = self.hook_resid_post(resid_pre + attn_out)  # [batch, pos, d_model]
-        return resid_post
+        if output_attentions:
+            return resid_post, output_attention
+        else:
+            return resid_post
 
     def apply_mlp(
         self, normalized_resid: Float[torch.Tensor, "batch pos d_model"]

@@ -1071,6 +1071,7 @@ class HookedTransformer(HookedRootModule):
         default_prepend_bos: bool = True,
         default_padding_side: Literal["left", "right"] = "right",
         dtype="float32",
+        first_n_layers: Optional[int] = None,
         **from_pretrained_kwargs,
     ) -> "HookedTransformer":
         """Load in a Pretrained Model.
@@ -1205,6 +1206,7 @@ class HookedTransformer(HookedRootModule):
                 the model.
             default_padding_side: Which side to pad on when tokenizing. Defaults to
                 "right".
+            first_n_layers: If specified, only load the first n layers of the model.
         """
 
         assert not (
@@ -1264,6 +1266,7 @@ class HookedTransformer(HookedRootModule):
             n_devices=n_devices,
             default_prepend_bos=default_prepend_bos,
             dtype=dtype,
+            first_n_layers=first_n_layers,
             **from_pretrained_kwargs,
         )
 
@@ -1572,7 +1575,10 @@ class HookedTransformer(HookedRootModule):
             # so that quantization settings are not lost
             self.load_state_dict(state_dict, assign=True, strict=False)
         else:
-            self.load_state_dict(state_dict, strict=False)
+            state_dict_keys = list(state_dict.keys())
+            for key in state_dict_keys:
+                self.load_state_dict({key: state_dict[key]}, strict=False)
+                del state_dict[key]
 
     def fill_missing_keys(self, state_dict):
         return loading.fill_missing_keys(self, state_dict)
@@ -1936,6 +1942,12 @@ class HookedTransformer(HookedRootModule):
         Toggles whether to allow editing of inputs to each attention head.
         """
         self.cfg.use_attn_in = use_attn_in
+
+    def set_ungroup_grouped_query_attention(self, ungroup_grouped_query_attention: bool):
+        """
+        Toggles whether to ungroup the grouped key and value heads in models with grouped query attention (GQA).
+        """
+        self.cfg.ungroup_grouped_query_attention = ungroup_grouped_query_attention
 
     def process_weights_(
         self,
