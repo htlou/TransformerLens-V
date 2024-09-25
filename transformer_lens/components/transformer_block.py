@@ -16,6 +16,7 @@ from transformer_lens.components import (
     LayerNormPre,
     RMSNorm,
     RMSNormPre,
+    MistralRMSNorm
 )
 from transformer_lens.components.mlps.can_be_used_as_mlp import CanBeUsedAsMLP
 from transformer_lens.factories.mlp_factory import MLPFactory
@@ -24,7 +25,7 @@ from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCacheEntry
 from transformer_lens.utils import repeat_along_head_dimension
 
-
+import pdb
 # Transformer Block
 class TransformerBlock(nn.Module):
     ln1: nn.Module
@@ -36,7 +37,7 @@ class TransformerBlock(nn.Module):
         self.cfg = HookedTransformerConfig.unwrap(cfg)
         normalization_layer: Callable  # type: ignore
         normalization_layer_after: Callable  # type: ignore
-
+        # pdb.set_trace()
         self.normalization_type = self.cfg.normalization_type
 
         if self.normalization_type == "LN":
@@ -48,6 +49,8 @@ class TransformerBlock(nn.Module):
             normalization_layer = RMSNorm
         elif self.normalization_type == "RMSPre":
             normalization_layer = RMSNormPre
+        elif self.normalization_type == "MistralRMSNorm":
+            normalization_layer = MistralRMSNorm
         elif self.normalization_type is None:
             # This should just be the identity.
             # We need to make this a lambda so we can call it on the config, just like the others
@@ -64,6 +67,8 @@ class TransformerBlock(nn.Module):
                 normalization_layer_after = RMSNorm
             elif self.normalization_type.startswith("LayerNorm"):
                 normalization_layer_after = LayerNorm
+            elif self.normalization_type.startswith("MistralRMSNorm"):
+                normalization_layer_after = MistralRMSNorm
 
         self.ln1 = normalization_layer(cfg)
         if self.cfg.use_normalization_before_and_after:
@@ -83,7 +88,7 @@ class TransformerBlock(nn.Module):
             self.attn = attention(self.cfg, attn_type, block_index)
         if not self.cfg.attn_only:
             self.mlp = MLPFactory.create_mlp(self.cfg)
-
+        
         self.hook_attn_in = HookPoint()  # [batch, pos, n_heads, d_model]
         self.hook_q_input = HookPoint()  # [batch, pos, n_heads, d_model]
         self.hook_k_input = HookPoint()  # [batch, pos, n_heads, d_model]
@@ -153,7 +158,6 @@ class TransformerBlock(nn.Module):
             query_input = attn_in
             key_input = attn_in
             value_input = attn_in
-
         
         output_attention = None
         if output_attentions:

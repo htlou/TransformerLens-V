@@ -479,7 +479,10 @@ class AbstractAttention(ABC, nn.Module):
         Float[torch.Tensor, "batch pos head_index d_head"],
         Float[torch.Tensor, "batch kv_pos head_index d_head"],
         Float[torch.Tensor, "batch kv_pos head_index d_head"],
-    ]:
+    ]:  
+        # import pdb
+        # print(value_input.shape, self.W_V.shape, self.b_V.shape)
+        # pdb.set_trace()
         attn_fn = (
             complex_attn_linear
             if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
@@ -540,8 +543,10 @@ class AbstractAttention(ABC, nn.Module):
                 + self.b_V
             )
         else:
+            
+            
             v = self.hook_v(attn_fn(value_input, self.W_V, self.b_V))
-
+        
         return q, k, v
 
     def calculate_attention_scores(

@@ -10,6 +10,7 @@ a deeper understanding of the internal workings of transformers like GPT-2.
 """
 import logging
 import os
+import pdb
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, cast, overload
 
 import einops
@@ -1250,6 +1251,8 @@ class HookedTransformer(HookedRootModule):
         # Get the model name used in HuggingFace, rather than the alias.
         official_model_name = loading.get_official_model_name(model_name)
 
+        # pdb.set_trace()
+
         # Load the config into an HookedTransformerConfig object. If loading from a
         # checkpoint, the config object will contain the information about the
         # checkpoint
@@ -1298,7 +1301,7 @@ class HookedTransformer(HookedRootModule):
         state_dict = loading.get_pretrained_state_dict(
             official_model_name, cfg, hf_model, dtype=dtype, **from_pretrained_kwargs
         )
-
+        pdb.set_trace()
         # Create the HookedTransformer object
         model = cls(
             cfg,
@@ -2090,7 +2093,7 @@ class HookedTransformer(HookedRootModule):
             else:
                 past_kv_cache = None
 
-            stop_tokens: List[int] = []
+            stop_tokens: list[int] = []
             eos_token_for_padding = 0
             assert self.tokenizer is not None
             if stop_at_eos:
@@ -2116,7 +2119,7 @@ class HookedTransformer(HookedRootModule):
 
             # An array to track which sequences in the batch have finished.
             finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=self.cfg.device)
-
+            pdb.set_trace()
             # Currently nothing in HookedTransformer changes with eval, but this is here in case
             # that changes in the future.
             self.eval()

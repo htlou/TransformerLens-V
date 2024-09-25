@@ -18,6 +18,17 @@ import torch
 from transformer_lens import utils
 from transformer_lens.utilities.activation_functions import SUPPORTED_ACTIVATIONS
 
+@dataclass
+class VisionConfig:
+    hidden_size: int
+    image_size: int
+    intermediate_size: int
+    model_type: str
+    num_attention_heads: int
+    num_hidden_layers: int
+    patch_size: int
+    projection_dim: int
+    vocab_size: int
 
 @dataclass
 class HookedTransformerConfig:
@@ -246,7 +257,18 @@ class HookedTransformerConfig:
     use_normalization_before_and_after: bool = False
     attn_scores_soft_cap: float = -1.0
     output_logits_soft_cap: float = -1.0
-
+    rotary_theta: Optional[float] = 0.0
+    ignore_index: Optional[int] =-100
+    image_grid_pinpoints: Optional[list[tuple[int, int]]]=None
+    image_token_index: Optional[int]= 32000
+    projector_hidden_act: Optional[str]="gelu"
+    use_image_newline_parameter:Optional[bool]=True
+    vision_config: Optional[VisionConfig] = None
+    vision_feature_layer: Optional[int] = -2
+    vision_feature_select_strategy: Optional[str] = "default"
+    vocab_size: Optional[int] = 32064
+    max_position_embeddings: Optional[int] =32768
+    
     def __post_init__(self):
         if self.n_heads == -1:
             self.n_heads = self.d_model // self.d_head

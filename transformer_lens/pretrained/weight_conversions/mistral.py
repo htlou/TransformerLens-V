@@ -1,6 +1,6 @@
 import einops
 import torch
-
+import pdb
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 
 
@@ -15,7 +15,6 @@ def convert_mistral_weights(mistral, cfg: HookedTransformerConfig):
     # Mistral has no biases anywhere
     for l in range(cfg.n_layers):
         state_dict[f"blocks.{l}.ln1.w"] = mistral.model.layers[l].input_layernorm.weight
-
         W_Q = mistral.model.layers[l].self_attn.q_proj.weight
         W_K = mistral.model.layers[l].self_attn.k_proj.weight
         W_V = mistral.model.layers[l].self_attn.v_proj.weight
@@ -53,5 +52,5 @@ def convert_mistral_weights(mistral, cfg: HookedTransformerConfig):
 
     state_dict["unembed.W_U"] = mistral.lm_head.weight.T
     state_dict["unembed.b_U"] = torch.zeros(cfg.d_vocab, dtype=cfg.dtype)
-
+    
     return state_dict
