@@ -854,7 +854,6 @@ class HookedLlava(HookedRootModule):
         vision_feature_select_strategy: Optional[str] = None,
         labels: Optional[torch.LongTensor] = None,
     ):  
-        
         device=input_ids.device
         self.vision_tower = self.vision_tower.to(device)
         self.multi_modal_projector = self.multi_modal_projector.to(device)
@@ -1065,16 +1064,12 @@ class HookedLlava(HookedRootModule):
                 #     "pixel_values": pixel_values,
                 #     "image_sizes": image_sizes,
                 # }
-            position_ids = torch.stack(getattr(model_inputs, "position_ids", []), dim=0) if "position_ids" in model_inputs else None
-            attention_mask = torch.stack(getattr(model_inputs, "attention_mask", []), dim=0) if "attention_mask" in model_inputs else None
-            pixel_values = torch.stack(getattr(model_inputs, "pixel_values", []), dim=0) if "pixel_values" in model_inputs else None
-            image_sizes = torch.stack(getattr(model_inputs, "image_sizes", []), dim=0) if "image_sizes" in model_inputs else None
-            # Assuming this is already batched or a list
-            # position_ids=model_inputs.getattr("image_sizes",None)
-            # past_kv_cache=model_inputs["past_key_values"]
-            # attention_mask=model_inputs["attention_mask"]
-            # pixel_values=model_inputs["pixel_values"]
-            # image_sizes=model_inputs["image_sizes"]
+            
+            position_ids=model_inputs.getattr("image_sizes",None)
+            past_kv_cache=model_inputs["past_key_values"]
+            attention_mask=model_inputs["attention_mask"]
+            pixel_values=model_inputs["pixel_values"]
+            image_sizes=model_inputs["image_sizes"]
             if not torch.equal(input, model_inputs["input_ids"]):
                 model_inputs["input_ids"]=input
         
