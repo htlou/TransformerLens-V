@@ -451,7 +451,7 @@ class HookedLlava(HookedRootModule):
             past_kv_cache (HookedTransformerKeyValueCache, optional): If passed, we're doing caching
                 and attention_mask will be stored in the cache.
         """
-        if isinstance(input, str) or isinstance(input, list):
+        if isinstance(input, str) or isinstance(input, list) :
             # If text, convert to tokens (batch_size=1)
             assert (
                 self.tokenizer is not None
@@ -1055,7 +1055,7 @@ class HookedLlava(HookedRootModule):
         Loss,
         Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss],
     ]:  
-        import pdb;pdb.set_trace()
+        
         if vision:
             # model_inputs={
                 #     "position_ids": position_ids,
@@ -1065,17 +1065,34 @@ class HookedLlava(HookedRootModule):
                 #     "image_sizes": image_sizes,
                 # }
             
-            position_ids=model_inputs.getattr("image_sizes",None)
-            past_kv_cache=model_inputs["past_key_values"]
-            attention_mask=model_inputs["attention_mask"]
-            pixel_values=model_inputs["pixel_values"]
-            image_sizes=model_inputs["image_sizes"]
-            if not torch.equal(input, model_inputs["input_ids"]):
-                model_inputs["input_ids"]=input
+            position_ids=model_inputs.get("position_ids")
+            past_kv_cache=model_inputs.get("past_kv_cache")
+            attention_mask=model_inputs.get("attention_mask")
+            pixel_values=model_inputs.get("pixel_values")
+            image_sizes=model_inputs.get("image_sizes")
+            input=model_inputs.get("input_ids")
+            if type(attention_mask)==list:
+                attention_mask=attention_mask[0]
+                Warning("attention_mask is list, which isn't supported in vision_embed now(241010)")
+            if type(input)==list:
+                input=input[0]
+            if type(image_sizes)==list:
+                image_sizes=image_sizes[0]
+            if type(pixel_values)==list:
+                pixel_values=pixel_values[0]
+            # import pdb;pdb.set_trace()
+            if position_ids is None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+
+            
+            # if not torch.equal(input, model_inputs["input_ids"]):
+            #     model_inputs["input_ids"]=input
         
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
-        ):
+        ):  
+
             if start_at_layer is None:
                 (
                     residual,
@@ -1091,7 +1108,7 @@ class HookedLlava(HookedRootModule):
                 )
                 if vision:
                     # 第一次以后attention_mask长度不变，inputs_embeds长度为1
-
+                    # import pdb;pdb.set_trace()
                     attention_mask,position_ids,past_kv_cache,inputs_embeds = self.vision_embed(
                         inputs_embeds=residual,
                         pixel_values=pixel_values,
@@ -1743,6 +1760,8 @@ class HookedLlava(HookedRootModule):
         if vision_tower != None:
             model.vision_tower=vision_tower
             model.multi_modal_projector=multi_modal_projector
+        else:
+            Warning("no vision_tower")
         return model
 
     @classmethod
