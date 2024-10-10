@@ -1055,6 +1055,7 @@ class HookedLlava(HookedRootModule):
         Loss,
         Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss],
     ]:  
+        import pdb;pdb.set_trace()
         if vision:
             # model_inputs={
                 #     "position_ids": position_ids,
@@ -1125,7 +1126,7 @@ class HookedLlava(HookedRootModule):
                         devices.get_device_for_block_index(i, self.cfg)
                     )
                 # import pdb; pdb.set_trace()
-                print(residual.shape)
+                # print(residual.shape)
                 residual = block(
                     residual,
                     # Cache contains a list of HookedTransformerKeyValueCache objects, one for each

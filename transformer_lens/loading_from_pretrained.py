@@ -227,7 +227,7 @@ OFFICIAL_MODEL_NAMES = [
     "google-t5/t5-base",
     "google-t5/t5-large",
     "ai-forever/mGPT",
-    "llava-hf/llava-v1.6-mistral-7b-hf"
+    "llava-hf/llava-v1.6-mistral-7b-hf",
     "htlou/AA-Chameleon-7B-plus",
 ]
 """Official model names for models on HuggingFace."""
