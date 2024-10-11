@@ -651,13 +651,13 @@ class HookedLlava(HookedRootModule):
         ignore_index = ignore_index if ignore_index is not None else self.cfg.ignore_index
 
         if self.training and self.padding_side == "left":
-            logger.warning_once(
+            Warning(
                 "Padding side is set to 'left' but the model is in training mode. For training "
                 "it is recommended to set `model.padding_side='right' and `processor.tokenizer.padding_side='right'`. "
                 "If that's intended, ignore this warning"
             )
         if not self.training and self.padding_side == "right":
-            logger.warning_once(
+            Warning(
                 "Padding side is set to 'right' but the model is in inference mode. For correct "
                 "generation results, please set `model.padding_side='left'` and `processor.tokenizer.padding_side='left'`. "
                 "If that's intended, ignore this warning"
