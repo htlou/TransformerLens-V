@@ -29,6 +29,7 @@ class Embed(nn.Module):
     ) -> Float[torch.Tensor, "batch pos d_model"]:
         # If A has shape [a, b] and B has shape [c, d], then A[:, B] has shape [a, c, d]
         # B acts as a tensor of indices into the second dimension (so >=0 and <b)
+        # tokens= tokens.to(self.W_E.device)
         if self.cfg.post_embedding_ln:
             return self.ln(self.W_E[tokens, :])
         return self.W_E[tokens, :]

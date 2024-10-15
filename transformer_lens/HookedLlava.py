@@ -8,6 +8,7 @@ attaching hooks to every notable activation within the model. This enables the i
 alteration of activations in individual components like attention heads and MLP layers, facilitating
 a deeper understanding of the internal workings of transformers like GPT-2.
 """
+import threading
 import logging
 import os
 import pdb
@@ -313,7 +314,7 @@ class HookedLlava(HookedRootModule):
 
         if move_to_device:
             # We load the devices in a pipeline manner - the first device gets the embed and
-            # pos_embed layers and the first n_layers // n_devices blocks, the second gets the next
+            # pos_embed layers and the first n_layers // n_devicees blocks,the second gets the next
             # n_layers // n_devices blocks ... the last gets the last n_layers // n_devices blocks,
             # the final normalization layer (if it exists) and the unembed layer
             self.move_model_modules_to_device()
@@ -1607,6 +1608,8 @@ class HookedLlava(HookedRootModule):
         return self.to("mps")
 
     def move_model_modules_to_device(self):
+        # all change there is temporally for 3090 situation, where the gpu memory is limited to 24GB.
+        Warning.warn("All changes in move_model_modules_to_device are temporally for 3090 situation, where the gpu memory is limited to 24GB",UserWarning)
         self.embed.to(devices.get_device_for_block_index(0, self.cfg))
         self.hook_embed.to(devices.get_device_for_block_index(0, self.cfg))
         if self.cfg.positional_embedding_type != "rotary":
@@ -1616,8 +1619,23 @@ class HookedLlava(HookedRootModule):
         if hasattr(self, "ln_final"):
             self.ln_final.to(devices.get_device_for_block_index(self.cfg.n_layers - 1, self.cfg))
         self.unembed.to(devices.get_device_for_block_index(self.cfg.n_layers - 1, self.cfg))
+        
+        # block_device_map=devices.compute_block_device_mapping(self.cfg)
+        
+        def move_block_to_device(block,i,cfg):
+            block.to(devices.get_device_for_block_index(i, cfg))
+
+        threads = []
         for i, block in enumerate(self.blocks):
-            block.to(devices.get_device_for_block_index(i, self.cfg))
+            t = threading.Thread(target=move_block_to_device, args=(block, i,self.cfg))
+            threads.append(t)
+            t.start()
+
+        # # 等待所有线程完成
+        for t in threads:
+            t.join()
+        # for i, block in enumerate(self.blocks):
+        #     block.to(devices.get_device_for_block_index(i, self.cfg))
 
     @classmethod
     def from_pretrained(

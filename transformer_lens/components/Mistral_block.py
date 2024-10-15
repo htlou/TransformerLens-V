@@ -174,6 +174,9 @@ class MistralBlock(TransformerBlock):
             # is added to the residual stream"
             attn_out = self.ln1_post(attn_out)
         attn_out = self.hook_attn_out(attn_out)
+        # attn_out = attn_out.to(self.hook_resid_mid.device)
+        # resid_pre = resid_pre.to(self.hook_resid_mid.device)
+        # import pdb; pdb.set_trace()
         if not self.cfg.attn_only and not self.cfg.parallel_attn_mlp:
             resid_mid = self.hook_resid_mid(resid_pre + attn_out)  # [batch, pos, d_model]
             mlp_in = (
