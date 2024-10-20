@@ -764,13 +764,17 @@ def test_prompt(
     logits = remove_batch_dim(model(tokens))
     probs = logits.softmax(dim=-1)
     answer_ranks = []
-    for index in range(prompt_length, prompt_length + answer_length):
+    # print(f"probs size: {probs.size()}, tokens size: {tokens.size()}")
+
+    for index in range(prompt_length, min(prompt_length + answer_length, probs.size(0) + 1)):
         answer_token = tokens[0, index]
         answer_str_token = answer_str_tokens[index - prompt_length]
         # Offset by 1 because models predict the NEXT token
         token_probs = probs[index - 1]
         sorted_token_probs, sorted_token_values = token_probs.sort(descending=True)
         # Janky way to get the index of the token in the sorted list - I couldn't find a better way?
+        if sorted_token_values.device!=answer_token.device:
+            answer_token=answer_token.to(sorted_token_values.device)
         correct_rank = torch.arange(len(sorted_token_values))[
             (sorted_token_values == answer_token).cpu()
         ].item()

@@ -452,6 +452,7 @@ class HookedLlava(HookedRootModule):
             past_kv_cache (HookedTransformerKeyValueCache, optional): If passed, we're doing caching
                 and attention_mask will be stored in the cache.
         """
+         
         if isinstance(input, str) or isinstance(input, list) :
             # If text, convert to tokens (batch_size=1)
             assert (
@@ -459,6 +460,10 @@ class HookedLlava(HookedRootModule):
             ), "Must provide a tokenizer if passing a string to the model"
             # This is only intended to support passing in a single string
             tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
+        elif isinstance(input,dict):
+            tokens = input["input_ids"]
+            if type(tokens)==list:
+                tokens=tokens[0]
         else:
             tokens = input
         if len(tokens.shape) == 1:
@@ -868,6 +873,7 @@ class HookedLlava(HookedRootModule):
         )
         if pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) > 0:
                 # ! infer image_num_patches from image_sizes
+                
                 image_num_patches = [
                     image_size_to_num_patches(
                         image_size=imsize,
@@ -879,16 +885,67 @@ class HookedLlava(HookedRootModule):
                 # figure out if pixel_values is concatenated or stacked
                 if pixel_values.dim() == 5:
                     # stacking when input is (batch_size, num_patches, num_channels, height, width)
+                    batch_size = pixel_values.size(0)
+                    # if batch_size > 7:
+                    #     # 将 pixel_values 分成两个批次
+                    #     batch1 = pixel_values[:7]
+                    #     batch2 = pixel_values[7:]
+
+                    #     # 对应的 image_num_patches 也需要分开
+                    #     image_num_patches1 = image_num_patches[:7]
+                    #     image_num_patches2 = image_num_patches[7:]
+
+                    #     # 处理第一个批次
+                    #     _pixel_values_list1 = [
+                    #         pix_val[:num_patch] for pix_val, num_patch in zip(batch1, image_num_patches1)
+                    #     ]
+                    #     # 在批次维度（dim=0）上拼接，保持通道数不变
+                    #     pixel_values1 = torch.cat(_pixel_values_list1, dim=0)
+                    #     image_features1 = self.vision_tower(pixel_values1, output_hidden_states=True)
+                    #     selected_image_feature1 = image_features1.hidden_states[vision_feature_layer]
+
+                    #     del batch1, pixel_values1, image_features1, _pixel_values_list1
+                    #     torch.cuda.synchronize()
+                    #     # 处理第二个批次
+                    #     _pixel_values_list2 = [
+                    #         pix_val[:num_patch] for pix_val, num_patch in zip(batch2, image_num_patches2)
+                    #     ]
+                    #     pixel_values2 = torch.cat(_pixel_values_list2, dim=0)
+                    #     image_features2 = self.vision_tower(pixel_values2, output_hidden_states=True)
+                    #     selected_image_feature2 = image_features2.hidden_states[vision_feature_layer]
+
+                    #     del batch2, pixel_values2, image_features2, _pixel_values_list2
+                    #     torch.cuda.synchronize()
+
+                    #     # 合并两个批次的特征
+                    #     selected_image_feature = torch.cat([selected_image_feature1, selected_image_feature2], dim=0)
+
+                    #     # 删除单独的特征变量，释放显存
+                    #     del selected_image_feature1, selected_image_feature2
+                    #     torch.cuda.synchronize()
+
+                    #     # 更新 image_num_patches
+                    #     image_num_patches = image_num_patches1 + image_num_patches2
+                    # else:
+                    #     # 如果 batch_size <= 7，正常处理
+                    #     _pixel_values_list = [
+                    #         pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)
+                    #     ]
+                    #     pixel_values = torch.cat(_pixel_values_list, dim=0)
+                    #     image_features = self.vision_tower(pixel_values, output_hidden_states=True)
+                    #     selected_image_feature = image_features.hidden_states[vision_feature_layer]
                     _pixel_values_list = [
                         pix_val[:num_patch] for pix_val, num_patch in zip(pixel_values, image_num_patches)
                     ]
                     pixel_values = torch.cat(_pixel_values_list, dim=0)
+                    image_features = self.vision_tower(pixel_values, output_hidden_states=True)
+                    selected_image_feature = image_features.hidden_states[vision_feature_layer]
                 elif pixel_values.dim() != 4:
                     # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
                     raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
 
-                image_features = self.vision_tower(pixel_values, output_hidden_states=True)
-                selected_image_feature = image_features.hidden_states[vision_feature_layer]
+                # image_features = self.vision_tower(pixel_values, output_hidden_states=True)
+                # selected_image_feature = image_features.hidden_states[vision_feature_layer]
 
                 if vision_feature_select_strategy == "default":
                     selected_image_feature = selected_image_feature[:, 1:]
@@ -1056,7 +1113,7 @@ class HookedLlava(HookedRootModule):
         Loss,
         Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss],
     ]:  
-        
+        # import pdb;pdb.set_trace()
         if vision:
             # model_inputs={
                 #     "position_ids": position_ids,
@@ -1071,12 +1128,12 @@ class HookedLlava(HookedRootModule):
             attention_mask=model_inputs.get("attention_mask")
             pixel_values=model_inputs.get("pixel_values")
             image_sizes=model_inputs.get("image_sizes")
-            input=model_inputs.get("input_ids")
+            input_ids=model_inputs.get("input_ids")
             if type(attention_mask)==list:
                 attention_mask=attention_mask[0]
                 Warning("attention_mask is list, which isn't supported in vision_embed now(241010)")
-            if type(input)==list:
-                input=input[0]
+            if type(input_ids)==list:
+                input_ids=input_ids[0]
             if type(image_sizes)==list:
                 image_sizes=image_sizes[0]
             if type(pixel_values)==list:
@@ -1087,8 +1144,9 @@ class HookedLlava(HookedRootModule):
                 position_ids.masked_fill_(attention_mask == 0, 1)
 
             
-            # if not torch.equal(input, model_inputs["input_ids"]):
-            #     model_inputs["input_ids"]=input
+            # if not torch.equal(input, input_ids):
+            input=input_ids
+            #     print("input is not equal to input_ids")
         
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
@@ -1135,26 +1193,30 @@ class HookedLlava(HookedRootModule):
             # exclusive.
             # Eg: start_at_layer==None + stop_at_layer==0 means to only run the embed.
             # Eg: start_at_layer==3 + stop_at_layer==-1 means to run from layer 3 until the end of the PENULTIMATE layer
-            blocks_and_idxs = list(zip(range(self.cfg.n_layers), self.blocks))
-            for i, block in blocks_and_idxs[start_at_layer:stop_at_layer]:  # type: ignore
-                # Note that each block includes skip connections, so we don't need
-                # residual + block(residual)
-                # If we're using multiple GPUs, we need to send the residual and shortformer_pos_embed to the correct GPU
-                residual = residual.to(devices.get_device_for_block_index(i, self.cfg))
-                if shortformer_pos_embed is not None:
-                    shortformer_pos_embed = shortformer_pos_embed.to(
-                        devices.get_device_for_block_index(i, self.cfg)
-                    )
-                # import pdb; pdb.set_trace()
-                # print(residual.shape)
-                residual = block(
-                    residual,
-                    # Cache contains a list of HookedTransformerKeyValueCache objects, one for each
-                    # block
-                    past_kv_cache_entry=past_kv_cache[i] if past_kv_cache is not None else None,
-                    shortformer_pos_embed=shortformer_pos_embed,
-                    attention_mask=attention_mask,
-                )  # [batch, pos, d_model]
+            with torch.cuda.amp.autocast():
+                blocks_and_idxs = list(zip(range(self.cfg.n_layers), self.blocks))
+                for i, block in blocks_and_idxs[start_at_layer:stop_at_layer]:  # type: ignore
+                    # Note that each block includes skip connections, so we don't need
+                    # residual + block(residual)
+                    # If we're using multiple GPUs, we need to send the residual and shortformer_pos_embed to the correct GPU
+                    residual = residual.to(devices.get_device_for_block_index(i, self.cfg))
+                    if shortformer_pos_embed is not None:
+                        shortformer_pos_embed = shortformer_pos_embed.to(
+                            devices.get_device_for_block_index(i, self.cfg)
+                        )
+                    # import pdb; pdb.set_trace()
+                    # print(residual.shape)
+                    residual = block(
+                        residual,
+                        # Cache contains a list of HookedTransformerKeyValueCache objects, one for each
+                        # block
+                        past_kv_cache_entry=past_kv_cache[i] if past_kv_cache is not None else None,
+                        shortformer_pos_embed=shortformer_pos_embed,
+                        attention_mask=attention_mask,
+                    )  # [batch, pos, d_model]
+                    
+                    # if past_kv_cache[i] is not None:
+                    #     del past_kv_cache[i]
 
             if stop_at_layer is not None:
                 # When we stop at an early layer, we end here rather than doing further computation
@@ -1609,7 +1671,7 @@ class HookedLlava(HookedRootModule):
 
     def move_model_modules_to_device(self):
         # all change there is temporally for 3090 situation, where the gpu memory is limited to 24GB.
-        Warning.warn("All changes in move_model_modules_to_device are temporally for 3090 situation, where the gpu memory is limited to 24GB",UserWarning)
+        # Warning.warn("All changes in move_model_modules_to_device are temporally for 3090 situation, where the gpu memory is limited to 24GB",UserWarning)
         self.embed.to(devices.get_device_for_block_index(0, self.cfg))
         self.hook_embed.to(devices.get_device_for_block_index(0, self.cfg))
         if self.cfg.positional_embedding_type != "rotary":
@@ -1622,20 +1684,20 @@ class HookedLlava(HookedRootModule):
         
         # block_device_map=devices.compute_block_device_mapping(self.cfg)
         
-        def move_block_to_device(block,i,cfg):
-            block.to(devices.get_device_for_block_index(i, cfg))
+        # def move_block_to_device(block,i,cfg):
+        #     block.to(devices.get_device_for_block_index(i, cfg))
 
-        threads = []
-        for i, block in enumerate(self.blocks):
-            t = threading.Thread(target=move_block_to_device, args=(block, i,self.cfg))
-            threads.append(t)
-            t.start()
-
-        # # 等待所有线程完成
-        for t in threads:
-            t.join()
+        # threads = []
         # for i, block in enumerate(self.blocks):
-        #     block.to(devices.get_device_for_block_index(i, self.cfg))
+        #     t = threading.Thread(target=move_block_to_device, args=(block, i,self.cfg))
+        #     threads.append(t)
+        #     t.start()
+
+        # # # 等待所有线程完成
+        # for t in threads:
+        #     t.join()
+        for i, block in enumerate(self.blocks):
+            block.to(devices.get_device_for_block_index(i, self.cfg))
 
     @classmethod
     def from_pretrained(

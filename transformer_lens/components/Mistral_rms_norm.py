@@ -41,6 +41,6 @@ class MistralRMSNorm(nn.Module):
         variance=x.pow(2).mean(-1, keepdim=True)
 
         x = self.hook_normalized(x *self.hook_scale(torch.rsqrt(variance+self.eps) )) # [batch, pos, length]
-        x=x.to(input_dtype)
-        x=x.to(self.w.device)
-        return self.w*x
+        # x=x.to(input_dtype)
+        # x=x.to(self.w.device)
+        return self.w*x.to(input_dtype)
