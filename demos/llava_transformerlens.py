@@ -39,7 +39,8 @@ def load_models_and_processor(model_name,model_path):
         tokenizer=None,
         dtype=torch.float32,
         vision_tower=vision_tower,
-        multi_modal_projector=multi_modal_projector
+        multi_modal_projector=multi_modal_projector,
+        
     )
     # print(hook_language_model.state_dict().keys())
     # print(vision_model.language_model.state_dict().keys())
@@ -137,7 +138,7 @@ def main():
     
     # consistent_check(hook_language_model, vision_model.language_model, tokenizer)
     # 加载图像并生成响应
-    image_path = "/home/saev/changye/TransformerLens-V/Apple.jpg"
+    image_path = "/home/saev/changye/TransformerLens-V/demo3.jpg"
     inputs = process_image_and_generate_response(processor, vision_model, image_path)
 
     inputs=inputs.to("cuda:0")
