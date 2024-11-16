@@ -4,54 +4,42 @@ import torch
 from PIL import Image
 from transformers import (
     AutoTokenizer,
-    LlavaNextForConditionalGeneration,
-    LlavaNextProcessor,
     AutoModelForCausalLM,
 )
 # sys.path.append('/aifs4su/yaodong/changye/TransformerLens_soft')
 from transformer_lens.HookedLlava import HookedLlava
 import pdb
 pdb.set_trace()
-MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
-MODEL_PATH="/home/saev/changye/model/llava"
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
+MODEL_PATH="/home/saev/changye/model/Mistral-7B-Instruct-v0.2"
 def load_models_and_processor(model_name,model_path):
     """
     加载处理器、视觉-语言模型和HookedTransformer语言模型。
     """
-    # 加载处理器和视觉-语言模型
-    processor = LlavaNextProcessor.from_pretrained(model_name,model_path)
-    vision_model = LlavaNextForConditionalGeneration.from_pretrained(
-        model_path, 
-        torch_dtype=torch.float32, 
-        low_cpu_mem_usage=True
-    )
-    print("Vision model loaded.")
-    vision_tower = vision_model.vision_tower
-    multi_modal_projector = vision_model.multi_modal_projector
-    # 加载 HookedTransformer 语言模型
+    hf_model = AutoModelForCausalLM.from_pretrained(model_path)
     hook_language_model = HookedLlava.from_pretrained(
         model_name,
-        hf_model=vision_model.language_model,
+        hf_model=hf_model,
         device="cuda", 
         fold_ln=False,
         center_writing_weights=False,
         center_unembed=False,
         tokenizer=None,
         dtype=torch.float32,
-        vision_tower=vision_tower,
-        multi_modal_projector=multi_modal_projector,
+        vision_tower=None,
+        multi_modal_projector=None,
         
     )
     # print(hook_language_model.state_dict().keys())
     # print(vision_model.language_model.state_dict().keys())
     # 将模型转移到GPU（如果可用）
     hook_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    vision_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    hf_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     hook_language_model = hook_language_model.to(hook_device)
-    vision_model = vision_model.to(vision_device)
+    hf_model = hf_model.to(hf_device)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-    return processor, vision_model, hook_language_model, tokenizer
+    return hf_model, hook_language_model, tokenizer
 
 def consistent_check(model, hf_model, tokenizer):
     """
@@ -106,45 +94,24 @@ def consistent_check(model, hf_model, tokenizer):
         assert torch.allclose(hf_logits, tl_logits, atol=1e-4, rtol=1e-2)
 
     print("Consistency check completed.")
-
-
-
-def process_image_and_generate_response(processor, vision_model, image_path):
-    """
-    加载图像并生成图像描述。
-    """
-    # 加载本地图像
-    image = Image.open(image_path)
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "What is shown in this image?"},
-                {"type": "image"},
-            ],
-        },
-    ]
-    prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
     
-    # 处理图像和文本输入
-    inputs = processor(images=image, text=prompt, return_tensors="pt")
-    return inputs
-
 def main():
     # 加载模型和处理器
-    processor, vision_model, hook_language_model, tokenizer= load_models_and_processor(MODEL_NAME,MODEL_PATH)
+    hf_model, hook_language_model, tokenizer = load_models_and_processor(MODEL_NAME,MODEL_PATH)
     
     # 进行一致性检查
-    
-    consistent_check(hook_language_model, vision_model.language_model, tokenizer)
-    # 加载图像并生成响应
-    image_path = "/home/saev/changye/TransformerLens-V/demo3.jpg"
-    inputs = process_image_and_generate_response(processor, vision_model, image_path)
-    input_text="The capital of America is"
-    # input_text=tokenizer.encode(input_text, return_tensors="pt")
+    #目前hf_model和hook_language_model的attention不同，hf采用SdpaAttention而hook_language_model采用普通的Attention，所以会有一些误差
+    #但又由于llavamistral采用了普通的Attention，所以这里的sae可能还要考虑一下选用哪一种Attention下的模型（1022）
+    consistent_check(hook_language_model, hf_model, tokenizer)
+
+    inputs="The capital of America is"
+    inputs=tokenizer(inputs,return_tensors="pt")["input_ids"]
     inputs=inputs.to("cuda:0")
-    outputs = hook_language_model.generate(input_text)
-    print(outputs)
-    # print(processor.decode(outputs[0], skip_special_tokens=True))
+    outputs = hook_language_model.generate(inputs)
+    # outputs = hf_model.generate(inputs)
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# 打印生成的文本
+    print(generated_text)
 if __name__ == "__main__":
     main()

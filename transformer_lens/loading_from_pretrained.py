@@ -229,6 +229,7 @@ OFFICIAL_MODEL_NAMES = [
     "ai-forever/mGPT",
     "llava-hf/llava-v1.6-mistral-7b-hf",
     "htlou/AA-Chameleon-7B-plus",
+    "mistralai/Mistral-7B-Instruct-v0.2",
 ]
 """Official model names for models on HuggingFace."""
 
@@ -728,7 +729,7 @@ def convert_hf_model_config(model_name: str, **kwargs):
         architecture = "Gemma2ForCausalLM"
     elif "gemma" in official_model_name.lower():
         architecture = "GemmaForCausalLM"
-    elif "llava-v1.6-mistral-7b-hf" in official_model_name.lower():
+    elif "llava-v1.6-mistral-7b-hf" in official_model_name.lower() or "mistralai/mistral-7b-instruct-v0.2" in official_model_name.lower():
         architecture="MistralForCausalLM"
     else:
         huggingface_token = os.environ.get("HF_TOKEN", None)
@@ -759,6 +760,29 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "final_rms": True,
             "gated_mlp": True,
         }
+    elif "mistralai/mistral-7b-instruct-v0.2" in official_model_name.lower():
+        print("Warning: Only loading mistralv0.2 model config")
+        cfg_dict = {
+                "d_model": 4096,
+                "d_head": 4096 // 32,
+                "n_heads": 32,
+                "d_mlp": 14336,
+                "n_layers": 32,
+                "n_ctx": 32768,  # Capped due to memory issues
+                "d_vocab": 32000,
+                "act_fn": "silu",
+                "normalization_type": "MistralRMSNorm",
+                "positional_embedding_type": "rotary",
+                "window_size": 4096,
+                "attn_types": ["global"] * 32 ,
+                "eps": 1e-05,
+                "n_key_value_heads": 8,
+                "gated_mlp": True,
+                "use_local_attn": False,
+                "rotary_dim": 4096 // 32,
+                "rotary_base":1e6,
+                "max_position_embeddings":32768,
+            }
     elif official_model_name.startswith("CodeLlama-7b"):  # same architecture CodeLlama and Llama-2
         cfg_dict = {
             "d_model": 4096,
@@ -997,7 +1021,7 @@ def convert_hf_model_config(model_name: str, **kwargs):
             "act_fn": "gelu",
             "attention_dir": "bidirectional",
         }
-    elif architecture == "MistralForCausalLM":
+    elif architecture == "MistralForCausalLM" and ("v0.2" not in official_model_name.lower()):
         cfg_dict = {
             "d_model": 4096,
             "d_head": 4096 // 32,
@@ -1780,7 +1804,7 @@ def get_pretrained_state_dict(
             state_dict = convert_bert_weights(hf_model, cfg)
         elif cfg.original_architecture == "T5ForConditionalGeneration":
             state_dict = convert_t5_weights(hf_model, cfg)
-        elif cfg.original_architecture == "MistralForCausalLM" and "llava-hf/llava-v1.6-mistral-7b-hf" in official_model_name:
+        elif cfg.original_architecture == "MistralForCausalLM" and (("llava-hf/llava-v1.6-mistral-7b-hf" in official_model_name) or ("mistralai/Mistral" in official_model_name)):
             state_dict = convert_mistral_v0_2_weights(hf_model, cfg)
         elif cfg.original_architecture == "MistralForCausalLM" :
             state_dict = convert_mistral_weights(hf_model, cfg)

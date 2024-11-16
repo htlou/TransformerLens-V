@@ -705,6 +705,7 @@ class HookedLlava(HookedRootModule):
             feature_lens = feature_lens.to(input_ids.device)
             feature_lens_batch = feature_lens.split(num_special_image_tokens.tolist(), dim=0)
             feature_lens_batch_sum = torch.tensor([x.sum() for x in feature_lens_batch], device=input_ids.device)
+            attention_mask=attention_mask.to(input_ids.device)
             embed_sequence_lengths = (
                 (attention_mask == 1).long().sum(-1) - num_special_image_tokens + feature_lens_batch_sum
             )
@@ -794,7 +795,7 @@ class HookedLlava(HookedRootModule):
         # final_attention_mask = final_attention_mask.to(torch.int)
         position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
 
-        return final_embedding, final_attention_mask, position_ids, final_labels, final_input_ids
+        return final_embedding, final_attention_mask, position_ids, final_labels, final_input_ids,image_to_overwrite
 
     def pack_image_features(self, image_features, image_sizes, image_newline=None):
         """
@@ -875,6 +876,7 @@ class HookedLlava(HookedRootModule):
             if vision_feature_select_strategy is not None
             else self.cfg.vision_feature_select_strategy
         )
+        image_to_overwrite=None
         if pixel_values is not None and input_ids.shape[1] != 1 and pixel_values.size(0) > 0:
                 # ! infer image_num_patches from image_sizes
                 
@@ -896,7 +898,7 @@ class HookedLlava(HookedRootModule):
                 elif pixel_values.dim() != 4:
                     # otherwise has to be stacked from list of (num_patches, num_channels, height, width)
                     raise ValueError(f"pixel_values of shape {pixel_values.shape}, expect to be of 4 or 5 dimensions")
-
+                self.vision_tower=self.vision_tower.to(pixel_values.device)
                 image_features = self.vision_tower(pixel_values, output_hidden_states=True)
                 selected_image_feature = image_features.hidden_states[vision_feature_layer]
 
@@ -904,7 +906,7 @@ class HookedLlava(HookedRootModule):
                     selected_image_feature = selected_image_feature[:, 1:]
                 elif vision_feature_select_strategy == "full":
                     selected_image_feature = selected_image_feature
-
+                self.multi_modal_projector=self.multi_modal_projector.to(pixel_values.device)
                 image_features = self.multi_modal_projector(selected_image_feature)
 
                 image_features = torch.split(image_features, image_num_patches, dim=0)
@@ -918,7 +920,8 @@ class HookedLlava(HookedRootModule):
                 )
 
                 inputs_embeds = inputs_embeds.to(image_features.dtype)
-                inputs_embeds, attention_mask, position_ids, labels, _ = self._merge_input_ids_with_image_features(
+                # image_to_overwrite:(batch,length), where False is the text embeds
+                inputs_embeds, attention_mask, position_ids, labels, _,image_to_overwrite = self._merge_input_ids_with_image_features(
                     image_features,
                     feature_lens,
                     inputs_embeds,
@@ -967,7 +970,7 @@ class HookedLlava(HookedRootModule):
                 attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
 
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
-        return attention_mask,position_ids,past_key_values,inputs_embeds,
+        return attention_mask,position_ids,past_key_values,inputs_embeds,image_to_overwrite
    
     @overload
     def forward(
@@ -1067,6 +1070,7 @@ class HookedLlava(HookedRootModule):
         Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss],
     ]:  
         # import pdb;pdb.set_trace()
+        
         if vision:
             # model_inputs={
                 #     "position_ids": position_ids,
@@ -1121,7 +1125,7 @@ class HookedLlava(HookedRootModule):
                 if vision:
                     # 第一次以后attention_mask长度不变，inputs_embeds长度为1
                     # import pdb;pdb.set_trace()
-                    attention_mask,position_ids,past_kv_cache,inputs_embeds = self.vision_embed(
+                    attention_mask,position_ids,past_kv_cache,inputs_embeds,image_to_overwrite = self.vision_embed(
                         inputs_embeds=residual,
                         pixel_values=pixel_values,
                         image_sizes=image_sizes,
@@ -1131,6 +1135,8 @@ class HookedLlava(HookedRootModule):
                         position_ids=position_ids,
                     )
                     residual=inputs_embeds
+                    if image_to_overwrite!= None:
+                        image_indice=image_to_overwrite[0].nonzero(as_tuple=True)[0]
                 
             else:
                 assert type(input) == torch.Tensor
@@ -1180,17 +1186,31 @@ class HookedLlava(HookedRootModule):
             if return_type is None:
                 return None
             else:
+
                 logits = self.unembed(residual)  # [batch, pos, d_vocab]
+                # if vision:
+                #     all_indices = torch.arange(logits.shape[1]).to(image_indice.device)
+                #     false_indices = all_indices[~torch.isin(all_indices, image_indice)]
+                #     false_indices=false_indices.to(logits.device)
+                #     logits= logits[:, false_indices, :]
+                #     attention_mask=attention_mask.to(logits.device)
+                #     attention_mask=attention_mask[:, false_indices]
+                #     batch_indice,text_indice=torch.where((tokens != self.cfg.image_token_index))
+                #     tokens= tokens[:,text_indice]
                 if self.cfg.output_logits_soft_cap > 0.0:
                     logits = self.cfg.output_logits_soft_cap * F.tanh(
                         logits / self.cfg.output_logits_soft_cap
                     )
                 if return_type == "logits":
                     return logits
+                elif return_type =="generate_with_saev":
+                    return logits,image_indice
                 else:
                     assert (
                         tokens is not None
                     ), "tokens must be passed in if return_type is 'loss' or 'both'"
+                    # print(logits.shape)
+                    # print(tokens.shape)
                     loss = self.loss_fn(logits, tokens, attention_mask, per_token=loss_per_token)
                     if return_type == "loss":
                         return loss
@@ -2475,36 +2495,48 @@ class HookedLlava(HookedRootModule):
         use_past_kv_cache: bool = True,
         prepend_bos: Optional[bool] = USE_DEFAULT_VALUE,
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
-        return_type: Optional[str] = "input",
+        return_type: Optional[str] = "tokens",
         verbose: bool = True,
+        sae_hook_name: Optional[str] = None,
     ) -> Union[Int[torch.Tensor, "batch pos_plus_new_tokens"], str]:
 
         with utils.LocallyOverridenDefaults(
             self, prepend_bos=prepend_bos, padding_side=padding_side
-        ):
-            input_ids=inputs.get("input_ids",inputs)
-            vision=False
-            attention_mask = inputs.get("attention_mask", None)
-            pixel_values = inputs.get("pixel_values", None)
-            image_sizes = inputs.get("image_sizes", None)
-            if input_ids==inputs:
-                if type(inputs) == str:
-                    # If text, convert to tokens (batch_size=1)
-                    assert (
-                        self.tokenizer is not None
-                    ), "Must provide a tokenizer if passing a string to the model"
-                    tokens = self.to_tokens(inputs, prepend_bos=prepend_bos, padding_side=padding_side)
-                else:
-                    tokens = inputs
+        ):  
+            vision = False  # 默认是文本输入模式
 
-                if return_type == "input":
-                    if type(inputs) == str:
-                        return_type = "str"
-                    else:
-                        return_type = "tensor"
-            else:   
-                tokens=input_ids
-                vision=True
+            # 区分输入类型（str, tensor, dict）
+            if isinstance(inputs, str):
+                # 输入是字符串（纯文本）
+                input_ids = inputs
+                vision = False
+            elif isinstance(inputs, dict):
+                # 输入是字典（可能包含image/text的相关字段）
+                input_ids = inputs.get("input_ids", inputs)
+                attention_mask = inputs.get("attention_mask", None)
+                pixel_values = inputs.get("pixel_values", None)
+                image_sizes = inputs.get("image_sizes", None)
+
+                # 如果包含图片数据，则切换到视觉模式
+                if pixel_values is not None:
+                    vision = True
+            else:
+                # 输入是 tensor 或其他类型
+                input_ids = inputs
+
+            # 处理输入模式（文本输入模式或视觉输入模式）
+            if isinstance(input_ids, str):
+                # 如果是文本，转换为 tokens
+                assert self.tokenizer is not None, "传递字符串时必须提供tokenizer"
+                tokens = self.to_tokens(input_ids, prepend_bos=prepend_bos, padding_side=padding_side)
+                return_type = "str" if return_type == "input" else "str"
+            else:
+                # 如果是 tensor 或 dict 模式下的输入
+                tokens = input_ids
+                return_type = "tensor"  # 默认返回 tensor 格式
+
+            # 设置视觉模式相关标志
+            if vision:
                 return_type = "tensor"
 
             assert isinstance(tokens, torch.Tensor)
@@ -2548,6 +2580,11 @@ class HookedLlava(HookedRootModule):
             # Currently nothing in HookedTransformer changes with eval, but this is here in case
             # that changes in the future.
             self.eval()
+            
+            if sae_hook_name is not None:
+                image_indice=None
+                tmp_cache_list=[]
+            
             for index in tqdm.tqdm(range(max_new_tokens), disable=not verbose):
                 # While generating, we keep generating logits, throw away all but the final logits,
                 # and then use those logits to sample from the distribution We keep adding the
@@ -2566,24 +2603,50 @@ class HookedLlava(HookedRootModule):
                 if use_past_kv_cache:
                     # We just take the final tokens, as a [batch, 1] tensor
                     if vision:
-                        if index > 0:
-                            logits = self.forward(
-                                tokens[:, -1:],
-                                return_type="logits",
-                                prepend_bos=prepend_bos,
-                                padding_side=padding_side,
-                                model_inputs=model_inputs,
-                                vision=vision,
-                            )
-                        else:
-                            logits = self.forward(
-                                tokens,
-                                return_type="logits",
-                                prepend_bos=prepend_bos,
-                                padding_side=padding_side,
-                                model_inputs=model_inputs,
-                                vision=vision,
-                            )
+                        if sae_hook_name is not None:
+                            if index > 0:
+                                (logits,image_indice),cache = self.run_with_cache(
+                                    tokens[:, -1:],
+                                    model_inputs=model_inputs,
+                                    vision=vision,
+                                    prepend_bos=prepend_bos,
+                                    padding_side=padding_side,
+                                    names_filter=lambda name: name == sae_hook_name,
+                                    return_type="generate_with_saev",
+                                )
+                            else:
+                                (logits,image_indice),cache = self.run_with_cache(
+                                    tokens,
+                                    model_inputs=model_inputs,
+                                    vision=vision,
+                                    prepend_bos=prepend_bos,
+                                    padding_side=padding_side,
+                                    names_filter=lambda name: name == sae_hook_name,
+                                    return_type="generate_with_saev",
+                                )
+                            image_indice = image_indice
+                            tmp_cache=cache[sae_hook_name]
+                            tmp_cache=tmp_cache.to("cpu")
+                            tmp_cache_list.append(tmp_cache)
+                        elif return_type == "logits":
+                            if index > 0:
+                                logits = self.forward(
+                                    tokens[:, -1:],
+                                    return_type="logits",
+                                    prepend_bos=prepend_bos,
+                                    padding_side=padding_side,
+                                    model_inputs=model_inputs,
+                                    vision=vision,
+                                )
+                            else:
+                                logits = self.forward(
+                                    tokens,
+                                    return_type="logits",
+                                    prepend_bos=prepend_bos,
+                                    padding_side=padding_side,
+                                    model_inputs=model_inputs,
+                                    vision=vision,
+                                )
                     else:
                         if index > 0:
                             logits = self.forward(
@@ -2653,6 +2716,8 @@ class HookedLlava(HookedRootModule):
                     return self.tokenizer.decode(tokens[0])
 
             else:
+                if sae_hook_name is not None:
+                    return tokens,image_indice,tmp_cache_list
                 return tokens
 
     # Give access to all weights as properties.
