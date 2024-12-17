@@ -268,6 +268,7 @@ class HookedTransformerConfig:
     vision_feature_select_strategy: Optional[str] = "default"
     vocab_size: Optional[int] = 32064
     max_position_embeddings: Optional[int] =32768
+    stop_at_layer:Optional[int] =None
     
     def __post_init__(self):
         if self.n_heads == -1:

@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, Optional, Union
-
+import json
 import torch
 from huggingface_hub import HfApi
 from transformers import (
@@ -1397,6 +1397,10 @@ def convert_vision_model_config(official_model_name: str, **kwargs):
     AutoConfig is not supported, because these models are in the HookedTransformer format, so we directly download and load the json.
     """
     official_model_name = get_official_model_name(official_model_name)
+    
+    # file_path="/data/models/llava-v1.6-mistral-7b-hf/config.json"
+    # cfg_json=json.load(open(file_path, "r"))
+    # print("tmp_setting in TransformerLens-V/transformer_lens/loading_from_pretrained.py 1402")
     cfg_json: dict = utils.download_file_from_hf(official_model_name, "config.json", **kwargs)
     if "mistral" in official_model_name:
         cfg_dict = {

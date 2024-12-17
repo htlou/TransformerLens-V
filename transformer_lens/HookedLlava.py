@@ -25,7 +25,7 @@ from jaxtyping import Float, Int
 from packaging import version
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from typing_extensions import Literal
-
+import time
 import transformer_lens.loading_from_pretrained as loading
 import transformer_lens.utils as utils
 from transformer_lens.ActivationCache import ActivationCache
@@ -203,6 +203,7 @@ class HookedLlava(HookedRootModule):
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         move_to_device: bool = True,
         default_padding_side: Literal["left", "right"] = "right",
+        stop_at_layer:Optional[int]=None,
     ):
         """Model initialization.
 
@@ -228,9 +229,9 @@ class HookedLlava(HookedRootModule):
         self.padding_side = "left"
         self.pad_token_id=-1
         self.cfg = HookedTransformerConfig.unwrap(cfg)
+        self.cfg.stop_at_layer=stop_at_layer
         
-        
-        
+        tokenizer_start_time = time.time()
         if tokenizer is not None:
             self.set_tokenizer(tokenizer, default_padding_side=default_padding_side)
         elif self.cfg.tokenizer_name is not None:
@@ -268,6 +269,9 @@ class HookedLlava(HookedRootModule):
                     "default_padding_side is explictly given but ignored because tokenizer is not set."
                 )
 
+        tokenizer_time = time.time() - tokenizer_start_time
+        print(f"Tokenizer setup time: {tokenizer_time:.2f}s")
+        
         self.embed = Embed(self.cfg)
         self.hook_embed = HookPoint()  # [batch, pos, d_model]
         self.dtype = self.cfg.dtype
@@ -307,6 +311,9 @@ class HookedLlava(HookedRootModule):
         self.unembed = Unembed(self.cfg)
 
         embed_std = 1/math.sqrt(self.cfg.d_model)
+        
+        embed_time = time.time() - tokenizer_time-tokenizer_start_time
+        print(f"Embedding setup time: {embed_time:.2f}s")
         self.image_newline = nn.Parameter(torch.randn(self.cfg.d_model,dtype=self.dtype) * embed_std)
         
         if self.cfg.init_weights:
@@ -319,6 +326,8 @@ class HookedLlava(HookedRootModule):
             # the final normalization layer (if it exists) and the unembed layer
             self.move_model_modules_to_device()
 
+        move_device_time=time.time() - tokenizer_time-tokenizer_start_time-embed_time 
+        print(f"Move device time: {move_device_time:.2f}s")
         # Helper variable to store a small (10K-20K) dataset of training data. Empty by default, can
         # be loaded with load_sample_training_dataset
         self.dataset = None
@@ -326,7 +335,10 @@ class HookedLlava(HookedRootModule):
         # Gives each module a parameter with its name (relative to this root module)
         # Needed for HookPoints to work
         self.setup()
-
+        
+        set_up_time=time.time() - tokenizer_time-tokenizer_start_time-embed_time-move_device_time
+        print(f"Set up time: {set_up_time:.2f}s")
+        
     def check_hooks_to_add(
         self,
         hook_point,
@@ -1135,8 +1147,19 @@ class HookedLlava(HookedRootModule):
                         position_ids=position_ids,
                     )
                     residual=inputs_embeds
+                    # print(inputs_embeds.shape)
+                    # print(f"image_to_overwrite",image_to_overwrite[0].shape,image_to_overwrite[1].shape)
+                    # print(f"image_to_overwrite nonzero",image_to_overwrite[0].nonzero(as_tuple=True)[0])
+                    image_indice=None
                     if image_to_overwrite!= None:
-                        image_indice=image_to_overwrite[0].nonzero(as_tuple=True)[0]
+                        image_indice_list=[]
+                        for i in range(len(image_to_overwrite)):
+                            image_indice_list.append(image_to_overwrite[i].nonzero(as_tuple=True)[0])
+                        # print(image_to_overwrite[0].nonzero()[0])
+                        # print(image_to_overwrite[0].nonzero()[1])
+                        image_indice=torch.stack(image_indice_list,dim=0)
+                        # print(image_indice)
+                        # print(image_indice.shape)
                 
             else:
                 assert type(input) == torch.Tensor
@@ -1179,7 +1202,7 @@ class HookedLlava(HookedRootModule):
 
             if stop_at_layer is not None:
                 # When we stop at an early layer, we end here rather than doing further computation
-                return residual
+                return residual,image_indice
 
             if self.cfg.normalization_type is not None:
                 residual = self.ln_final(residual)  # [batch, pos, d_model]
@@ -1204,6 +1227,7 @@ class HookedLlava(HookedRootModule):
                 if return_type == "logits":
                     return logits
                 elif return_type =="generate_with_saev":
+
                     return logits,image_indice
                 else:
                     assert (
@@ -1267,6 +1291,7 @@ class HookedLlava(HookedRootModule):
         out, cache_dict = super().run_with_cache(
             *model_args, remove_batch_dim=remove_batch_dim, **kwargs
         )
+        # print(f"out",out)
         if return_cache_object:
             cache = ActivationCache(cache_dict, self, has_batch_dim=not remove_batch_dim)
             return out, cache
@@ -1645,12 +1670,14 @@ class HookedLlava(HookedRootModule):
     def move_model_modules_to_device(self):
         # all change there is temporally for 3090 situation, where the gpu memory is limited to 24GB.
         # Warning.warn("All changes in move_model_modules_to_device are temporally for 3090 situation, where the gpu memory is limited to 24GB",UserWarning)
+        # if self.cfg.stop_at_layer is not None:
+        #     self.cfg.n_layers=self.cfg.stop_at_layer
         self.embed.to(devices.get_device_for_block_index(0, self.cfg))
         self.hook_embed.to(devices.get_device_for_block_index(0, self.cfg))
         if self.cfg.positional_embedding_type != "rotary":
             self.pos_embed.to(devices.get_device_for_block_index(0, self.cfg))
             self.hook_pos_embed.to(devices.get_device_for_block_index(0, self.cfg))
-
+        # import pdb;pdb.set_trace()
         if hasattr(self, "ln_final"):
             self.ln_final.to(devices.get_device_for_block_index(self.cfg.n_layers - 1, self.cfg))
         self.unembed.to(devices.get_device_for_block_index(self.cfg.n_layers - 1, self.cfg))
@@ -1670,6 +1697,8 @@ class HookedLlava(HookedRootModule):
         # for t in threads:
         #     t.join()
         for i, block in enumerate(self.blocks):
+            if self.cfg.stop_at_layer is not None and i > self.cfg.stop_at_layer:
+                break
             block.to(devices.get_device_for_block_index(i, self.cfg))
 
     @classmethod
@@ -1693,14 +1722,19 @@ class HookedLlava(HookedRootModule):
         dtype=torch.float32,
         vision_tower=Optional[None],
         multi_modal_projector=Optional[None],
+        stop_at_layer=Optional[None],
         **from_pretrained_kwargs,
     ) -> "HookedTransformer":
         
+        start_time = time.time() 
 
         assert not (
             from_pretrained_kwargs.get("load_in_8bit", False)
             or from_pretrained_kwargs.get("load_in_4bit", False)
         ), "Quantization not supported"
+        
+        quantization_time = time.time() - start_time
+        print(f"Quantization check time: {quantization_time:.2f}s")
 
         if hf_model is not None:
             hf_cfg = hf_model.config.to_dict()
@@ -1721,6 +1755,9 @@ class HookedLlava(HookedRootModule):
                 ), "Only bitsandbytes quantization is supported"
         else:
             hf_cfg = {}
+            
+        config_load_time = time.time() - start_time
+        print(f"Configuration loading time: {config_load_time:.2f}s")
 
         if isinstance(dtype, str):
             # Convert from string to a torch dtype
@@ -1756,6 +1793,10 @@ class HookedLlava(HookedRootModule):
             dtype=dtype,
             **from_pretrained_kwargs,
         )
+        
+        config_process_time = time.time() - config_load_time - start_time
+        print(f"Model configuration processing time: {config_process_time:.2f}s")
+        
         # pdb.set_trace()
         if cfg.positional_embedding_type == "shortformer":
             if fold_ln:
@@ -1788,6 +1829,9 @@ class HookedLlava(HookedRootModule):
         state_dict = loading.get_pretrained_state_dict(
             official_model_name, cfg, hf_model, dtype=dtype, **from_pretrained_kwargs
         )
+        
+        state_dict_load_time = time.time() - config_process_time - config_load_time - start_time
+        print(f"State dict loading time: {state_dict_load_time:.2f}s")
 
         # Create the HookedTransformer object
         model = cls(
@@ -1795,7 +1839,11 @@ class HookedLlava(HookedRootModule):
             tokenizer,
             move_to_device=False,
             default_padding_side=default_padding_side,
+            stop_at_layer=stop_at_layer,
         )
+        
+        model_creation_time = time.time() - state_dict_load_time - config_process_time - config_load_time - start_time
+        print(f"Model creation time: {model_creation_time:.2f}s")
 
         model.load_and_process_state_dict(
             state_dict,
@@ -1805,11 +1853,18 @@ class HookedLlava(HookedRootModule):
             fold_value_biases=fold_value_biases,
             refactor_factored_attn_matrices=refactor_factored_attn_matrices,
         )
+        
+        state_dict_processing_time = time.time() - model_creation_time - state_dict_load_time - config_process_time - config_load_time - start_time
+        print(f"State dict processing time: {state_dict_processing_time:.2f}s")
 
         if move_to_device:
             model.move_model_modules_to_device()
 
-        print(f"Loaded pretrained model {model_name} into HookedTransformer")
+        device_move_time = time.time() - state_dict_processing_time - model_creation_time - state_dict_load_time - config_process_time - config_load_time - start_time
+        print(f"Device moving time: {device_move_time:.2f}s")
+
+        # Final step: 打印完成信息
+        print(f"Total loading time: {time.time() - start_time:.2f}s")
         if vision_tower != None:
             model.vision_tower=vision_tower
             model.multi_modal_projector=multi_modal_projector
@@ -2717,6 +2772,7 @@ class HookedLlava(HookedRootModule):
 
             else:
                 if sae_hook_name is not None:
+
                     return tokens,image_indice,tmp_cache_list
                 return tokens
 
